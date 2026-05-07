@@ -21,9 +21,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/blang/semver"
 	"github.com/joho/godotenv"
+	"github.com/rhysd/go-github-selfupdate/selfupdate"
 	"github.com/xuri/excelize/v2"
 )
+
+const version = "1.0.1"
 
 // ─── Payloads ────────────────────────────────────────────────────────────────
 
@@ -43,17 +47,17 @@ type PayloadLinhaCompraCD struct {
 }
 
 type LinhaLoja struct {
-	LojaKey                   int    `json:"lojaKey"`
-	QuantidadeEstoqueSeguranca int   `json:"quantidadeEstoqueDeSeguranca"`
-	QuantidadeEstoqueMaximo   int    `json:"quantidadeEstoqueMaximo"`
-	QuantidadePontoExtra      int    `json:"quantidadePontoExtra"`
-	Multiplo                  int    `json:"multiplo"`
-	DistribuirPor             string `json:"distribuirPor"`
-	QuantidadeAtacado         int    `json:"quantidadeAtacado"`
-	CrossDocking              bool   `json:"crossDocking"`
-	Remover                   bool   `json:"remover"`
-	OperacaoEntreLojaSuspensa bool   `json:"operacaoEntreLojaSuspensa"`
-	CompraSuspensa            bool   `json:"compraSuspensa"`
+	LojaKey                    int    `json:"lojaKey"`
+	QuantidadeEstoqueSeguranca int    `json:"quantidadeEstoqueDeSeguranca"`
+	QuantidadeEstoqueMaximo    int    `json:"quantidadeEstoqueMaximo"`
+	QuantidadePontoExtra       int    `json:"quantidadePontoExtra"`
+	Multiplo                   int    `json:"multiplo"`
+	DistribuirPor              string `json:"distribuirPor"`
+	QuantidadeAtacado          int    `json:"quantidadeAtacado"`
+	CrossDocking               bool   `json:"crossDocking"`
+	Remover                    bool   `json:"remover"`
+	OperacaoEntreLojaSuspensa  bool   `json:"operacaoEntreLojaSuspensa"`
+	CompraSuspensa             bool   `json:"compraSuspensa"`
 }
 
 type PayloadLinhaLoja struct {
@@ -74,10 +78,10 @@ type ItemPreTransferencia struct {
 }
 
 type PayloadPreTransferencia struct {
-	LojaOrigemKey                              int                    `json:"lojaOrigemKey"`
-	QuantidadeDiasSugestao                     int                    `json:"quantidadeDiasSugestao"`
-	ALojaDeOrigemNaoPodeEstarNaListaDeDestino  int                    `json:"alojaDeOrigemNaoPodeEstarNaListaDeDestino"`
-	Produtos                                   []ItemPreTransferencia `json:"produtos"`
+	LojaOrigemKey                             int                    `json:"lojaOrigemKey"`
+	QuantidadeDiasSugestao                    int                    `json:"quantidadeDiasSugestao"`
+	ALojaDeOrigemNaoPodeEstarNaListaDeDestino int                    `json:"alojaDeOrigemNaoPodeEstarNaListaDeDestino"`
+	Produtos                                  []ItemPreTransferencia `json:"produtos"`
 }
 
 type LogEntry struct {
@@ -390,15 +394,15 @@ func consultarGTINv(tenant, token, gtin string) (*ProdutoInfo, int, string, erro
 // ─── Leitura da planilha TOYNG ────────────────────────────────────────────────
 
 type ProdutoLinha struct {
-	LinhaPlanilha int            // número da linha na planilha (1-indexed) — usado pra exibir e retry
-	EAN           string         // EAN 13 (unidade) — obrigatório no modelo ficha
-	DUN           string         // DUN 14 (caixa) — opcional, usado quando CD em CX
-	NCM           string         // opcional, usado pela operação Alterar NCM
-	Lojas         []int          // lojaKeys com valor > 0 — usado pelas ops legadas
-	Quantidades   map[int]int    // loja → quantidade; usado pela Pré-transferência
-	LojaOrigem    int            // só preenchido no modelo PT
-	CodigoPT      int            // produtoKey direto, quando vem da coluna "codigo" do modelo PT
-	GTINPT        int            // gtin direto, quando vem da coluna "barra" do modelo PT
+	LinhaPlanilha int         // número da linha na planilha (1-indexed) — usado pra exibir e retry
+	EAN           string      // EAN 13 (unidade) — obrigatório no modelo ficha
+	DUN           string      // DUN 14 (caixa) — opcional, usado quando CD em CX
+	NCM           string      // opcional, usado pela operação Alterar NCM
+	Lojas         []int       // lojaKeys com valor > 0 — usado pelas ops legadas
+	Quantidades   map[int]int // loja → quantidade; usado pela Pré-transferência
+	LojaOrigem    int         // só preenchido no modelo PT
+	CodigoPT      int         // produtoKey direto, quando vem da coluna "codigo" do modelo PT
+	GTINPT        int         // gtin direto, quando vem da coluna "barra" do modelo PT
 }
 
 // excluida = lojas que nunca recebem parâmetro (sempre filtradas).
@@ -747,7 +751,7 @@ func dedupInts(xs []int) []int {
 // ─── Processamento principal ──────────────────────────────────────────────────
 
 const compradorKey = 655124
-const divisaoKey   = 1
+const divisaoKey = 1
 
 func processarProduto(
 	tenant, token string,
@@ -849,7 +853,8 @@ func processarProduto(
 		for i, l := range produto.Lojas {
 			linhas[i] = LinhaLoja{
 				LojaKey:       l,
-				DistribuirPor: "PALETE",
+				DistribuirPor: "UNIDADE",
+				Multiplo:      1,
 			}
 		}
 		ep := fmt.Sprintf("https://erp.bluesoft.com.br/%s/api/compras/sortimento/linhadeloja/%d", tenant, infoUN.ProdutoKey)
@@ -1021,10 +1026,10 @@ func processarPreTransferencia(
 			}
 			chunk := itens[i:j]
 			payload := PayloadPreTransferencia{
-				LojaOrigemKey:                              origem,
-				QuantidadeDiasSugestao:                     0,
-				ALojaDeOrigemNaoPodeEstarNaListaDeDestino:  1,
-				Produtos:                                   chunk,
+				LojaOrigemKey:                             origem,
+				QuantidadeDiasSugestao:                    0,
+				ALojaDeOrigemNaoPodeEstarNaListaDeDestino: 1,
+				Produtos: chunk,
 			}
 			ep := fmt.Sprintf("https://erp.bluesoft.com.br/%s/api/modulos/estoque/operacoes-entre-lojas/pre-transferencia-multiloja", tenant)
 			status, body, err := postAPI(token, ep, payload)
@@ -1192,15 +1197,15 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 // runOpcoes é o body comum de /api/run e /api/retry.
 type runOpcoes struct {
-	ID              string `json:"id"`
-	LinhaCompra     bool   `json:"linhaCompra"`
-	LinhaCompraCD   bool   `json:"linhaCompraCD"`
-	LinhaLoja       bool   `json:"linhaLoja"`
-	AlterarNCM      bool   `json:"alterarNCM"`
-	PreTransferencia bool  `json:"preTransferencia"`
-	CdTipo          string `json:"cdTipo"`
-	LojaOrigem      int    `json:"lojaOrigem"` // só usado quando formato=ficha + PT
-	Linhas          []int  `json:"linhas,omitempty"` // só usado em /api/retry
+	ID               string `json:"id"`
+	LinhaCompra      bool   `json:"linhaCompra"`
+	LinhaCompraCD    bool   `json:"linhaCompraCD"`
+	LinhaLoja        bool   `json:"linhaLoja"`
+	AlterarNCM       bool   `json:"alterarNCM"`
+	PreTransferencia bool   `json:"preTransferencia"`
+	CdTipo           string `json:"cdTipo"`
+	LojaOrigem       int    `json:"lojaOrigem"`       // só usado quando formato=ficha + PT
+	Linhas           []int  `json:"linhas,omitempty"` // só usado em /api/retry
 }
 
 func handleRun(w http.ResponseWriter, r *http.Request) {
@@ -1319,11 +1324,21 @@ func executaSSE(w http.ResponseWriter, r *http.Request, isRetry bool) {
 	emit(EventoSSE{Tipo: "ok", Op: "Auth", Mensagem: "autenticado"})
 
 	ops := []string{}
-	if req.AlterarNCM { ops = append(ops, "Alterar NCM") }
-	if req.LinhaCompra { ops = append(ops, "Linha Compra") }
-	if req.LinhaLoja { ops = append(ops, "Sortimento") }
-	if req.LinhaCompraCD { ops = append(ops, "Linha CD ("+req.CdTipo+")") }
-	if req.PreTransferencia { ops = append(ops, "Pré-transferência") }
+	if req.AlterarNCM {
+		ops = append(ops, "Alterar NCM")
+	}
+	if req.LinhaCompra {
+		ops = append(ops, "Linha Compra")
+	}
+	if req.LinhaLoja {
+		ops = append(ops, "Sortimento")
+	}
+	if req.LinhaCompraCD {
+		ops = append(ops, "Linha CD ("+req.CdTipo+")")
+	}
+	if req.PreTransferencia {
+		ops = append(ops, "Pré-transferência")
+	}
 	emitInfo("Operações: " + strings.Join(ops, " · "))
 	emitInfo(fmt.Sprintf("Processando %d linhas…", len(produtos)))
 
@@ -1425,8 +1440,36 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(htmlUI))
 }
 
+func abrirNavegador(u string) {
+	switch runtime.GOOS {
+	case "windows":
+		exec.Command("rundll32", "url.dll,FileProtocolHandler", u).Start()
+	case "darwin":
+		exec.Command("open", u).Start()
+	default:
+		exec.Command("xdg-open", u).Start()
+	}
+}
+
+func updater() {
+	v := semver.MustParse(version)
+	latest, err := selfupdate.UpdateSelf(v, "MateusLDK/helper") // Seu repo
+	if err != nil {
+		log.Println("Erro ao verificar atualização:", err)
+		return
+	}
+
+	if latest.Version.Equals(v) {
+		log.Println("✅ Já está na última versão:", version)
+	} else {
+		log.Printf("🔄 Atualizado de %s para %s!", version, latest.Version)
+		log.Println("Reinicie o programa para usar a nova versão")
+	}
+}
+
 func main() {
 	godotenv.Load(envPath())
+	updater()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		log.Fatal("Não foi possível abrir porta:", err)
@@ -1448,15 +1491,4 @@ func main() {
 	}()
 	fmt.Printf("Bluesoft Uploader rodando em %s\n", addr)
 	http.Serve(ln, nil)
-}
-
-func abrirNavegador(u string) {
-	switch runtime.GOOS {
-	case "windows":
-		exec.Command("rundll32", "url.dll,FileProtocolHandler", u).Start()
-	case "darwin":
-		exec.Command("open", u).Start()
-	default:
-		exec.Command("xdg-open", u).Start()
-	}
 }
