@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -62,9 +64,46 @@ type PayloadNCM struct {
 	NCM string `json:"ncm"`
 }
 
+type ItemPreTransferencia struct {
+	ProdutoKey                    int  `json:"produtoKey,omitempty"`
+	GTIN                          int  `json:"gtin,omitempty"`
+	LojaDestinoKey                int  `json:"lojaDestinoKey"`
+	Quantidade                    int  `json:"quantidade"`
+	DeveInformarOProdutoKeyOuGtin bool `json:"deveInformarOProdutoKeyOuGtin"`
+	QuantidadeFracionada          bool `json:"quantidadeFracionada"`
+}
+
+type PayloadPreTransferencia struct {
+	LojaOrigemKey                              int                    `json:"lojaOrigemKey"`
+	QuantidadeDiasSugestao                     int                    `json:"quantidadeDiasSugestao"`
+	ALojaDeOrigemNaoPodeEstarNaListaDeDestino  int                    `json:"alojaDeOrigemNaoPodeEstarNaListaDeDestino"`
+	Produtos                                   []ItemPreTransferencia `json:"produtos"`
+}
+
 type LogEntry struct {
 	Tipo     string `json:"tipo"`
 	Mensagem string `json:"mensagem"`
+}
+
+// EventoSSE é o evento estruturado emitido pelo /api/run e /api/retry.
+type EventoSSE struct {
+	Tipo     string `json:"tipo"`            // ok | erro | aviso | info | fim
+	Op       string `json:"op,omitempty"`    // NCM | Compra | Loja | CD3 | CD306 | etc
+	Mensagem string `json:"mensagem"`        // texto livre
+	EAN      string `json:"ean,omitempty"`   // EAN do produto, quando aplicável
+	Linha    int    `json:"linha,omitempty"` // linha da planilha (1-indexed), quando aplicável
+}
+
+// FileSession guarda os produtos lidos de uma planilha pra serem reusados em /api/run e /api/retry.
+type FileSession struct {
+	ID        string
+	Filename  string
+	Size      int64
+	Path      string // arquivo temporário (xlsx)
+	Formato   string // "ficha" ou "pt"
+	Produtos  []ProdutoLinha
+	Avisos    []string
+	CreatedAt time.Time
 }
 
 // Canal de cancelamento — fechado por /api/cancel para interromper o loop em handleUpload.
@@ -72,6 +111,22 @@ var (
 	cancelChan chan struct{}
 	cancelMu   sync.Mutex
 )
+
+// Storage de sessões de upload — produtos lidos da planilha aguardando /api/run.
+var sessoes sync.Map // string -> *FileSession
+
+func novoID() string {
+	var b [12]byte
+	_, _ = rand.Read(b[:])
+	return base64.RawURLEncoding.EncodeToString(b[:])
+}
+
+func envPath() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), ".env")
+	}
+	return ".env"
+}
 
 // ─── Logger persistente em arquivo ────────────────────────────────────────────
 
@@ -335,31 +390,82 @@ func consultarGTINv(tenant, token, gtin string) (*ProdutoInfo, int, string, erro
 // ─── Leitura da planilha TOYNG ────────────────────────────────────────────────
 
 type ProdutoLinha struct {
-	EAN   string // EAN 13 (unidade) — obrigatório
-	DUN   string // DUN 14 (caixa) — opcional, usado quando CD em CX
-	NCM   string // opcional, usado pela operação Alterar NCM
-	Lojas []int  // lojaKeys com valor > 0
+	LinhaPlanilha int            // número da linha na planilha (1-indexed) — usado pra exibir e retry
+	EAN           string         // EAN 13 (unidade) — obrigatório no modelo ficha
+	DUN           string         // DUN 14 (caixa) — opcional, usado quando CD em CX
+	NCM           string         // opcional, usado pela operação Alterar NCM
+	Lojas         []int          // lojaKeys com valor > 0 — usado pelas ops legadas
+	Quantidades   map[int]int    // loja → quantidade; usado pela Pré-transferência
+	LojaOrigem    int            // só preenchido no modelo PT
+	CodigoPT      int            // produtoKey direto, quando vem da coluna "codigo" do modelo PT
+	GTINPT        int            // gtin direto, quando vem da coluna "barra" do modelo PT
 }
 
-func lerPlanilha(caminho string) ([]ProdutoLinha, error) {
+// excluida = lojas que nunca recebem parâmetro (sempre filtradas).
+// Inclui números pontuais e o range 200–300 (inativadas).
+func lojaExcluida(l int) bool {
+	switch l {
+	case 5, 9, 13, 15, 16, 17, 18:
+		return true
+	}
+	return l >= 200 && l <= 300
+}
+
+// lerPlanilha detecta o formato e despacha para o parser apropriado.
+// Retorna produtos, avisos, formato ("ficha" | "pt") e erro.
+func lerPlanilha(caminho string) ([]ProdutoLinha, []string, string, error) {
 	f, err := excelize.OpenFile(caminho)
 	if err != nil {
-		return nil, fmt.Errorf("não foi possível abrir: %v", err)
+		return nil, nil, "", fmt.Errorf("não foi possível abrir: %v", err)
 	}
 	defer f.Close()
 
-	rows, err := f.GetRows("Preencher")
-	if err != nil {
-		return nil, fmt.Errorf("aba 'Preencher' não encontrada")
-	}
-	if len(rows) < 8 {
-		return nil, fmt.Errorf("planilha com menos de 8 linhas")
+	// Tentativa 1: ficha de cadastro (aba "Preencher", header em rows[7] com "EAN 13").
+	if rows, err := f.GetRows("Preencher"); err == nil && len(rows) >= 8 {
+		header := rows[7]
+		for _, h := range header {
+			if strings.Contains(strings.ToUpper(strings.TrimSpace(h)), "EAN 13") {
+				produtos, avisos, perr := lerPlanilhaFicha(rows)
+				if perr != nil {
+					return nil, nil, "", perr
+				}
+				return produtos, avisos, "ficha", nil
+			}
+		}
 	}
 
-	// Linha 8 (índice 7) = cabeçalhos
+	// Tentativa 2: modelo PT (primeira aba, header em rows[0] com "codigo"/"barra" + "origem").
+	sheets := f.GetSheetList()
+	if len(sheets) > 0 {
+		if rows, err := f.GetRows(sheets[0]); err == nil && len(rows) >= 1 {
+			header := rows[0]
+			temIdent, temOrigem := false, false
+			for _, h := range header {
+				low := strings.ToLower(strings.TrimSpace(h))
+				if low == "codigo" || low == "código" || low == "barra" {
+					temIdent = true
+				}
+				if low == "origem" {
+					temOrigem = true
+				}
+			}
+			if temIdent && temOrigem {
+				produtos, avisos, perr := lerPlanilhaPT(rows)
+				if perr != nil {
+					return nil, nil, "", perr
+				}
+				return produtos, avisos, "pt", nil
+			}
+		}
+	}
+
+	return nil, nil, "", fmt.Errorf("formato não reconhecido: aba 'Preencher' com EAN 13 (linha 8) ou modelo de pré-transferência com 'codigo'/'barra' + 'origem' (linha 1)")
+}
+
+// lerPlanilhaFicha lê o formato tradicional: aba "Preencher", header na linha 8.
+func lerPlanilhaFicha(rows [][]string) ([]ProdutoLinha, []string, error) {
 	header := rows[7]
 
-	// Sempre captura EAN 13, DUN 14 e NCM (DUN/NCM são opcionais).
 	eanCol, dunCol, ncmCol := -1, -1, -1
 	type lojaCol struct {
 		idx  int
@@ -377,40 +483,32 @@ func lerPlanilha(caminho string) ([]ProdutoLinha, error) {
 		} else if ncmCol == -1 && strings.Contains(hUp, "NCM") {
 			ncmCol = i
 		}
-		// tenta parsear como inteiro (número de loja)
 		if v, err := strconv.Atoi(h); err == nil {
 			lojaCols = append(lojaCols, lojaCol{i, v})
 		}
 	}
 
 	if eanCol == -1 {
-		return nil, fmt.Errorf("coluna 'EAN 13' não encontrada no cabeçalho (linha 8)")
+		return nil, nil, fmt.Errorf("coluna 'EAN 13' não encontrada no cabeçalho (linha 8)")
 	}
 	if len(lojaCols) == 0 {
-		return nil, fmt.Errorf("nenhuma coluna de loja encontrada")
+		return nil, nil, fmt.Errorf("nenhuma coluna de loja encontrada")
 	}
 
-	// Lojas que nunca recebem parâmetro — sempre filtradas.
-	// Inclui números pontuais e o range 200–300 (inativadas).
-	excluida := func(l int) bool {
-		switch l {
-		case 5, 9, 13, 15, 16, 17, 18:
-			return true
-		}
-		return l >= 200 && l <= 300
-	}
-
-	// Lista de todas as lojas válidas da planilha (usado quando linha está toda em 0).
 	var todasLojas []int
 	for _, lc := range lojaCols {
-		if !excluida(lc.loja) {
+		if !lojaExcluida(lc.loja) {
 			todasLojas = append(todasLojas, lc.loja)
 		}
 	}
 
 	var result []ProdutoLinha
-	// Dados a partir da linha 9 (índice 8)
-	for _, row := range rows[8:] {
+	contadores := struct {
+		semNCM     int
+		expandidas int
+	}{}
+	for rowIdx, row := range rows[8:] {
+		linhaPlanilha := rowIdx + 9
 		if len(row) == 0 {
 			continue
 		}
@@ -429,8 +527,12 @@ func lerPlanilha(caminho string) ([]ProdutoLinha, error) {
 		if ncmCol >= 0 && ncmCol < len(row) {
 			ncm = strings.TrimSpace(row[ncmCol])
 		}
+		if ncm == "" {
+			contadores.semNCM++
+		}
 
-		// Colunas de loja com valor > 0
+		// Lê quantidades + lista de lojas (>0).
+		quantidades := map[int]int{}
 		var lojas []int
 		for _, lc := range lojaCols {
 			if lc.idx >= len(row) {
@@ -445,25 +547,171 @@ func lerPlanilha(caminho string) ([]ProdutoLinha, error) {
 				continue
 			}
 			lojas = append(lojas, lc.loja)
+			quantidades[lc.loja] = int(v)
 		}
 
-		// Convenção do compras: linha toda em 0 → considerar todas as lojas válidas.
+		// Convenção do compras: linha toda em 0 → considerar todas as lojas válidas (qty=1).
 		if len(lojas) == 0 {
-			lojas = append(lojas, todasLojas...)
+			for _, l := range todasLojas {
+				lojas = append(lojas, l)
+				quantidades[l] = 1
+			}
+			contadores.expandidas++
 		}
 
-		// Filtra lojas excluídas (sempre).
+		// Filtra lojas excluídas.
 		filtradas := lojas[:0]
 		for _, l := range lojas {
-			if !excluida(l) {
+			if !lojaExcluida(l) {
 				filtradas = append(filtradas, l)
+			} else {
+				delete(quantidades, l)
 			}
 		}
 		lojas = filtradas
 
-		result = append(result, ProdutoLinha{EAN: ean, DUN: dun, NCM: ncm, Lojas: lojas})
+		result = append(result, ProdutoLinha{
+			LinhaPlanilha: linhaPlanilha,
+			EAN:           ean,
+			DUN:           dun,
+			NCM:           ncm,
+			Lojas:         lojas,
+			Quantidades:   quantidades,
+		})
 	}
-	return result, nil
+
+	var avisos []string
+	if contadores.semNCM > 0 {
+		avisos = append(avisos, fmt.Sprintf("%d linhas com NCM ausente", contadores.semNCM))
+	}
+	if contadores.expandidas > 0 {
+		avisos = append(avisos, fmt.Sprintf("%d linhas sem lojas — expandidas para todas", contadores.expandidas))
+	}
+	return result, avisos, nil
+}
+
+// lerPlanilhaPT lê o modelo de pré-transferência: header na linha 1, com colunas
+// "codigo" ou "barra", "origem" e colunas de loja com quantidades.
+func lerPlanilhaPT(rows [][]string) ([]ProdutoLinha, []string, error) {
+	header := rows[0]
+
+	codigoCol, barraCol, origemCol := -1, -1, -1
+	type lojaCol struct {
+		idx  int
+		loja int
+	}
+	var lojaCols []lojaCol
+
+	for i, h := range header {
+		h = strings.TrimSpace(h)
+		low := strings.ToLower(h)
+		switch low {
+		case "codigo", "código":
+			if codigoCol == -1 {
+				codigoCol = i
+			}
+		case "barra":
+			if barraCol == -1 {
+				barraCol = i
+			}
+		case "origem":
+			if origemCol == -1 {
+				origemCol = i
+			}
+		}
+		if v, err := strconv.Atoi(h); err == nil {
+			lojaCols = append(lojaCols, lojaCol{i, v})
+		}
+	}
+
+	if codigoCol == -1 && barraCol == -1 {
+		return nil, nil, fmt.Errorf("coluna 'codigo' ou 'barra' não encontrada na linha 1")
+	}
+	if origemCol == -1 {
+		return nil, nil, fmt.Errorf("coluna 'origem' não encontrada na linha 1")
+	}
+	if len(lojaCols) == 0 {
+		return nil, nil, fmt.Errorf("nenhuma coluna de loja encontrada na linha 1")
+	}
+
+	var result []ProdutoLinha
+	semOrigem, semIdent := 0, 0
+	for rowIdx, row := range rows[1:] {
+		linhaPlanilha := rowIdx + 2 // header em 1, dados começam em 2
+		if len(row) == 0 {
+			continue
+		}
+
+		var codigoPT, gtinPT int
+		if codigoCol >= 0 && codigoCol < len(row) {
+			if v, err := strconv.Atoi(strings.TrimSpace(row[codigoCol])); err == nil && v > 0 {
+				codigoPT = v
+			}
+		}
+		if codigoPT == 0 && barraCol >= 0 && barraCol < len(row) {
+			if v, err := strconv.Atoi(strings.TrimSpace(row[barraCol])); err == nil && v > 0 {
+				gtinPT = v
+			}
+		}
+		if codigoPT == 0 && gtinPT == 0 {
+			semIdent++
+			continue
+		}
+
+		origem := 0
+		if origemCol < len(row) {
+			if v, err := strconv.Atoi(strings.TrimSpace(row[origemCol])); err == nil {
+				origem = v
+			}
+		}
+		if origem == 0 {
+			semOrigem++
+			continue
+		}
+
+		quantidades := map[int]int{}
+		var lojas []int
+		for _, lc := range lojaCols {
+			if lc.idx >= len(row) {
+				continue
+			}
+			val := strings.TrimSpace(row[lc.idx])
+			if val == "" || val == "0" || val == "-" {
+				continue
+			}
+			v, err := strconv.ParseFloat(val, 64)
+			if err != nil || v <= 0 {
+				continue
+			}
+			if lojaExcluida(lc.loja) {
+				continue
+			}
+			lojas = append(lojas, lc.loja)
+			quantidades[lc.loja] = int(v)
+		}
+
+		if len(lojas) == 0 {
+			continue
+		}
+
+		result = append(result, ProdutoLinha{
+			LinhaPlanilha: linhaPlanilha,
+			Lojas:         lojas,
+			Quantidades:   quantidades,
+			LojaOrigem:    origem,
+			CodigoPT:      codigoPT,
+			GTINPT:        gtinPT,
+		})
+	}
+
+	var avisos []string
+	if semOrigem > 0 {
+		avisos = append(avisos, fmt.Sprintf("%d linhas sem coluna 'origem' preenchida — ignoradas", semOrigem))
+	}
+	if semIdent > 0 {
+		avisos = append(avisos, fmt.Sprintf("%d linhas sem 'codigo' nem 'barra' — ignoradas", semIdent))
+	}
+	return result, avisos, nil
 }
 
 // ─── Lógica de CD ────────────────────────────────────────────────────────────
@@ -507,12 +755,17 @@ func processarProduto(
 	fazerLinhaCompra, fazerLinhaCompraCD, fazerLinhaLoja, fazerNCM bool,
 	cdTipo string,
 	rl *runLog,
-	send func(tipo, msg string),
+	emit func(EventoSSE),
 ) {
+	// Helper para preencher EAN/Linha automaticamente em cada evento.
+	send := func(tipo, op, msg string) {
+		emit(EventoSSE{Tipo: tipo, Op: op, Mensagem: msg, EAN: produto.EAN, Linha: produto.LinhaPlanilha})
+	}
+
 	// Operações de loja exigem ao menos uma loja na planilha.
 	exigeLojas := fazerLinhaCompra || fazerLinhaCompraCD || fazerLinhaLoja
 	if exigeLojas && len(produto.Lojas) == 0 {
-		send("info", fmt.Sprintf("⚠  EAN %s: sem lojas ativas, pulando", produto.EAN))
+		send("info", "", fmt.Sprintf("EAN %s: sem lojas ativas, pulando", produto.EAN))
 		return
 	}
 
@@ -528,11 +781,11 @@ func processarProduto(
 		rl.httpCall("GTIN lookup (EAN)", "GET",
 			fmt.Sprintf("/comercial/produtos/gtin/%s", produto.EAN), nil, status, body, err)
 		if err != nil {
-			send("erro", fmt.Sprintf("❌ EAN %s: %v", produto.EAN, err))
+			send("erro", "GTIN", fmt.Sprintf("EAN %s: %v", produto.EAN, err))
 			return
 		}
 		if i.ProdutoKey == 0 {
-			send("aviso", fmt.Sprintf("⚠ EAN %s: produto_key não encontrado, pulando", produto.EAN))
+			send("aviso", "GTIN", fmt.Sprintf("EAN %s: produto não encontrado no tenant", produto.EAN))
 			return
 		}
 		infoUN = i
@@ -540,30 +793,29 @@ func processarProduto(
 
 	// ── 0. Alterar NCM ──
 	if fazerNCM && infoUN != nil {
-		prefix := fmt.Sprintf("EAN %s (produto %d)", produto.EAN, infoUN.ProdutoKey)
+		op := "NCM"
 		if produto.NCM == "" {
-			send("aviso", fmt.Sprintf("⚠ %s | NCM: vazio na planilha, pulando", prefix))
+			send("aviso", op, fmt.Sprintf("EAN %s: NCM ausente na planilha, pulando", produto.EAN))
 		} else {
 			ep := fmt.Sprintf("https://erp.bluesoft.com.br/%s/api/comercial/produtos/%d", tenant, infoUN.ProdutoKey)
 			payload := PayloadNCM{NCM: produto.NCM}
 			status, body, err := putAPI(token, ep, payload)
-			rl.httpCall("Alterar NCM | "+prefix, "PUT", ep, payload, status, body, err)
+			rl.httpCall(fmt.Sprintf("NCM | EAN %s (produto %d)", produto.EAN, infoUN.ProdutoKey), "PUT", ep, payload, status, body, err)
 			if err != nil || (status != 200 && status != 201 && status != 204) {
-				msg := apiErrMsg(status, body, err)
-				send("erro", fmt.Sprintf("❌ %s | NCM: %s", prefix, msg))
+				send("erro", op, fmt.Sprintf("EAN %s — %s", produto.EAN, apiErrMsg(status, body, err)))
 			} else {
-				send("ok", fmt.Sprintf("✅ %s | NCM atualizado: %s", prefix, produto.NCM))
+				send("ok", op, fmt.Sprintf("EAN %s → NCM %s", produto.EAN, produto.NCM))
 			}
 		}
 	}
 
 	// ── 1. Linha de Compra (paralelo, uma req por loja) ──
 	if fazerLinhaCompra && infoUN != nil {
-		prefix := fmt.Sprintf("EAN %s (produto %d)", produto.EAN, infoUN.ProdutoKey)
+		op := "Compra"
 		ep := fmt.Sprintf("https://erp.bluesoft.com.br/%s/api/compras/sortimento/linhadecompra", tenant)
 
 		var wg sync.WaitGroup
-		var sucesso, falha int32
+		var sucesso int32
 		for _, loja := range produto.Lojas {
 			wg.Add(1)
 			go func(l int) {
@@ -576,11 +828,9 @@ func processarProduto(
 					LojaKey:       l,
 				}
 				status, body, err := postAPI(token, ep, payload)
-				rl.httpCall(fmt.Sprintf("Linha Compra | %s | loja %d", prefix, l), "POST", ep, payload, status, body, err)
+				rl.httpCall(fmt.Sprintf("Compra | EAN %s (produto %d) | loja %d", produto.EAN, infoUN.ProdutoKey, l), "POST", ep, payload, status, body, err)
 				if err != nil || (status != 200 && status != 201) {
-					msg := apiErrMsg(status, body, err)
-					send("erro", fmt.Sprintf("❌ %s | Linha Compra loja %d: %s", prefix, l, msg))
-					atomic.AddInt32(&falha, 1)
+					send("erro", op, fmt.Sprintf("EAN %s loja %d — %s", produto.EAN, l, apiErrMsg(status, body, err)))
 				} else {
 					atomic.AddInt32(&sucesso, 1)
 				}
@@ -588,13 +838,13 @@ func processarProduto(
 		}
 		wg.Wait()
 		if sucesso > 0 {
-			send("ok", fmt.Sprintf("✅ %s | Linha Compra: %d/%d lojas OK", prefix, sucesso, len(produto.Lojas)))
+			send("ok", op, fmt.Sprintf("EAN %s — %d/%d lojas OK", produto.EAN, sucesso, len(produto.Lojas)))
 		}
 	}
 
 	// ── 2. Sortimento / Linha de Loja ──
 	if fazerLinhaLoja && infoUN != nil {
-		prefix := fmt.Sprintf("EAN %s (produto %d)", produto.EAN, infoUN.ProdutoKey)
+		op := "Sortimento"
 		linhas := make([]LinhaLoja, len(produto.Lojas))
 		for i, l := range produto.Lojas {
 			linhas[i] = LinhaLoja{
@@ -605,34 +855,32 @@ func processarProduto(
 		ep := fmt.Sprintf("https://erp.bluesoft.com.br/%s/api/compras/sortimento/linhadeloja/%d", tenant, infoUN.ProdutoKey)
 		payload := PayloadLinhaLoja{Linhas: linhas}
 		status, body, err := postAPI(token, ep, payload)
-		rl.httpCall("Linha Loja | "+prefix, "POST", ep, payload, status, body, err)
+		rl.httpCall(fmt.Sprintf("Sortimento | EAN %s (produto %d)", produto.EAN, infoUN.ProdutoKey), "POST", ep, payload, status, body, err)
 		if err != nil || (status != 200 && status != 201) {
-			msg := apiErrMsg(status, body, err)
-			send("erro", fmt.Sprintf("❌ %s | Linha Loja: %s", prefix, msg))
+			send("erro", op, fmt.Sprintf("EAN %s — %s", produto.EAN, apiErrMsg(status, body, err)))
 		} else {
-			send("ok", fmt.Sprintf("✅ %s | Linha Loja: OK (%d lojas)", prefix, len(produto.Lojas)))
+			send("ok", op, fmt.Sprintf("EAN %s — %d lojas OK", produto.EAN, len(produto.Lojas)))
 		}
 	}
 
 	// ── 3. Linha de Compra CD ──
 	if fazerLinhaCompraCD {
-		// Resolve a info correta para o CD: UN reaproveita infoUN; CX faz lookup pelo DUN.
 		var infoCD *ProdutoInfo
 		gtinCD := produto.EAN
 		if precisaCX {
 			if produto.DUN == "" {
-				send("aviso", fmt.Sprintf("⚠ EAN %s: sem DUN 14 na planilha, pulando Linha CD", produto.EAN))
+				send("aviso", "CD", fmt.Sprintf("EAN %s: sem DUN 14, pulando CD", produto.EAN))
 				return
 			}
 			i, status, body, err := consultarGTINv(tenant, token, produto.DUN)
 			rl.httpCall("GTIN lookup (DUN)", "GET",
 				fmt.Sprintf("/comercial/produtos/gtin/%s", produto.DUN), nil, status, body, err)
 			if err != nil {
-				send("erro", fmt.Sprintf("❌ DUN %s: %v", produto.DUN, err))
+				send("erro", "CD", fmt.Sprintf("DUN %s: %v", produto.DUN, err))
 				return
 			}
 			if i.ProdutoKey == 0 {
-				send("aviso", fmt.Sprintf("⚠ DUN %s: produto_key não encontrado, pulando Linha CD", produto.DUN))
+				send("aviso", "CD", fmt.Sprintf("DUN %s: produto não encontrado, pulando CD", produto.DUN))
 				return
 			}
 			infoCD = i
@@ -644,7 +892,6 @@ func processarProduto(
 			return
 		}
 
-		prefix := fmt.Sprintf("%s %s (produto %d)", gtinLabel(precisaCX), gtinCD, infoCD.ProdutoKey)
 		cds := agruparPorCD(produto.Lojas)
 
 		var wg sync.WaitGroup
@@ -652,6 +899,7 @@ func processarProduto(
 			wg.Add(1)
 			go func(cdKey int, lojas []int) {
 				defer wg.Done()
+				op := fmt.Sprintf("CD%d", cdKey)
 				lojasFinal := dedupInts(append([]int{cdKey}, lojas...))
 				payload := PayloadLinhaCompraCD{
 					FornecedorKey: infoCD.FornecedorKey,
@@ -661,12 +909,11 @@ func processarProduto(
 				}
 				ep := fmt.Sprintf("https://erp.bluesoft.com.br/%s/api/compras/sortimento/linhadecompra/cd/%d", tenant, cdKey)
 				status, body, err := postAPI(token, ep, payload)
-				rl.httpCall(fmt.Sprintf("Linha CD%d | %s", cdKey, prefix), "POST", ep, payload, status, body, err)
+				rl.httpCall(fmt.Sprintf("CD%d | %s %s (produto %d)", cdKey, gtinLabel(precisaCX), gtinCD, infoCD.ProdutoKey), "POST", ep, payload, status, body, err)
 				if err != nil || (status != 200 && status != 201) {
-					msg := apiErrMsg(status, body, err)
-					send("erro", fmt.Sprintf("❌ %s | Linha CD%d: %s", prefix, cdKey, msg))
+					send("erro", op, fmt.Sprintf("%s %s — %s", gtinLabel(precisaCX), gtinCD, apiErrMsg(status, body, err)))
 				} else {
-					send("ok", fmt.Sprintf("✅ %s | Linha CD%d: OK (%d lojas)", prefix, cdKey, len(lojasFinal)))
+					send("ok", op, fmt.Sprintf("%s %s — %d lojas OK", gtinLabel(precisaCX), gtinCD, len(lojasFinal)))
 				}
 			}(cdKey, lojas)
 		}
@@ -679,6 +926,127 @@ func gtinLabel(cx bool) string {
 		return "DUN"
 	}
 	return "EAN"
+}
+
+// ─── Pré-transferência ────────────────────────────────────────────────────────
+
+const preTransfChunkSize = 500
+
+// processarPreTransferencia agrupa produtos por loja origem e dispara um POST por chunk.
+// formato: "ficha" → usa lojaOrigemUI; "pt" → usa produto.LojaOrigem.
+func processarPreTransferencia(
+	tenant, token, formato string,
+	produtos []ProdutoLinha,
+	lojaOrigemUI int,
+	rl *runLog,
+	emit func(EventoSSE),
+	cancel <-chan struct{},
+) (preTransfKeys []int) {
+	// Agrupa entradas (produtoKey/gtin, destino, qty) por loja origem.
+	porOrigem := map[int][]ItemPreTransferencia{}
+	for _, p := range produtos {
+		var origem int
+		if formato == "pt" {
+			origem = p.LojaOrigem
+		} else {
+			origem = lojaOrigemUI
+		}
+		if origem == 0 {
+			emit(EventoSSE{Tipo: "aviso", Op: "PT", Mensagem: fmt.Sprintf("linha %d sem origem definida — pulando", p.LinhaPlanilha), Linha: p.LinhaPlanilha})
+			continue
+		}
+		for _, dest := range p.Lojas {
+			if dest == origem {
+				continue // origem nunca é destino dela mesma
+			}
+			qty := p.Quantidades[dest]
+			if qty <= 0 {
+				continue
+			}
+			item := ItemPreTransferencia{
+				LojaDestinoKey:                dest,
+				Quantidade:                    qty,
+				DeveInformarOProdutoKeyOuGtin: false,
+				QuantidadeFracionada:          false,
+			}
+			// Identificador do produto:
+			// - PT com codigo → produtoKey direto
+			// - PT com barra → gtin direto
+			// - ficha → gtin do EAN 13
+			if p.CodigoPT > 0 {
+				item.ProdutoKey = p.CodigoPT
+			} else if p.GTINPT > 0 {
+				item.GTIN = p.GTINPT
+			} else if p.EAN != "" {
+				if v, err := strconv.Atoi(p.EAN); err == nil {
+					item.GTIN = v
+				} else {
+					emit(EventoSSE{Tipo: "aviso", Op: "PT", Mensagem: fmt.Sprintf("linha %d EAN inválido (%q) — pulando", p.LinhaPlanilha, p.EAN), Linha: p.LinhaPlanilha})
+					continue
+				}
+			} else {
+				emit(EventoSSE{Tipo: "aviso", Op: "PT", Mensagem: fmt.Sprintf("linha %d sem identificador — pulando", p.LinhaPlanilha), Linha: p.LinhaPlanilha})
+				continue
+			}
+			porOrigem[origem] = append(porOrigem[origem], item)
+		}
+	}
+
+	if len(porOrigem) == 0 {
+		emit(EventoSSE{Tipo: "aviso", Op: "PT", Mensagem: "nada a transferir após filtrar destinos"})
+		return
+	}
+
+	for origem, itens := range porOrigem {
+		// Cancelamento entre origens.
+		select {
+		case <-cancel:
+			emit(EventoSSE{Tipo: "aviso", Mensagem: "⛔ cancelado"})
+			return
+		default:
+		}
+
+		emit(EventoSSE{Tipo: "info", Op: "PT", Mensagem: fmt.Sprintf("origem %d — %d entradas em %d chunks", origem, len(itens), (len(itens)+preTransfChunkSize-1)/preTransfChunkSize)})
+
+		for i := 0; i < len(itens); i += preTransfChunkSize {
+			select {
+			case <-cancel:
+				emit(EventoSSE{Tipo: "aviso", Mensagem: "⛔ cancelado"})
+				return
+			default:
+			}
+			j := i + preTransfChunkSize
+			if j > len(itens) {
+				j = len(itens)
+			}
+			chunk := itens[i:j]
+			payload := PayloadPreTransferencia{
+				LojaOrigemKey:                              origem,
+				QuantidadeDiasSugestao:                     0,
+				ALojaDeOrigemNaoPodeEstarNaListaDeDestino:  1,
+				Produtos:                                   chunk,
+			}
+			ep := fmt.Sprintf("https://erp.bluesoft.com.br/%s/api/modulos/estoque/operacoes-entre-lojas/pre-transferencia-multiloja", tenant)
+			status, body, err := postAPI(token, ep, payload)
+			rl.httpCall(fmt.Sprintf("Pré-transferência | origem %d | chunk %d-%d", origem, i+1, j), "POST", ep, payload, status, body, err)
+			if err != nil || (status != 200 && status != 201) {
+				emit(EventoSSE{Tipo: "erro", Op: "PT", Mensagem: fmt.Sprintf("origem %d (chunk %d-%d) — %s", origem, i+1, j, apiErrMsg(status, body, err))})
+				continue
+			}
+			// Tenta extrair preTransferenciaMultilojasKey da resposta.
+			ref := ""
+			var resp map[string]any
+			if json.Unmarshal([]byte(body), &resp) == nil {
+				if k, ok := resp["preTransferenciaMultilojasKey"].(float64); ok {
+					key := int(k)
+					ref = fmt.Sprintf(" #%d", key)
+					preTransfKeys = append(preTransfKeys, key)
+				}
+			}
+			emit(EventoSSE{Tipo: "ok", Op: "PT", Mensagem: fmt.Sprintf("origem %d — %d entradas OK%s", origem, len(chunk), ref)})
+		}
+	}
+	return
 }
 
 func apiErrMsg(status int, body string, err error) string {
@@ -699,17 +1067,210 @@ func apiErrMsg(status int, body string, err error) string {
 
 // ─── Handlers HTTP ────────────────────────────────────────────────────────────
 
+// handleSetup retorna o status atual do .env (configurado ou não) sem expor segredos.
+func handleSetup(w http.ResponseWriter, r *http.Request) {
+	tenant := os.Getenv("BLUESOFT_TENANT")
+	clientID := os.Getenv("client_id")
+	clientSecret := os.Getenv("client_secret")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"configured": tenant != "" && clientID != "" && clientSecret != "",
+		"tenant":     tenant,
+	})
+}
+
+// handleSetupTest tenta autenticar com as credenciais informadas (não grava nada).
+func handleSetupTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req struct {
+		Tenant       string `json:"tenant"`
+		ClientID     string `json:"clientId"`
+		ClientSecret string `json:"clientSecret"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := obterToken(req.Tenant, req.ClientID, req.ClientSecret); err != nil {
+		json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+// handleSetupSave grava o .env ao lado do executável e atualiza os env vars do processo.
+func handleSetupSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req struct {
+		Tenant       string `json:"tenant"`
+		ClientID     string `json:"clientId"`
+		ClientSecret string `json:"clientSecret"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	envMap := map[string]string{
+		"BLUESOFT_TENANT": req.Tenant,
+		"client_id":       req.ClientID,
+		"client_secret":   req.ClientSecret,
+	}
+	if err := godotenv.Write(envMap, envPath()); err != nil {
+		http.Error(w, "não foi possível gravar .env: "+err.Error(), 500)
+		return
+	}
+	for k, v := range envMap {
+		os.Setenv(k, v)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+// handleUpload recebe a planilha, valida e devolve metadata. Não executa nada.
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "arquivo não recebido", 400)
+		return
+	}
+	defer file.Close()
+
+	tmp, err := os.CreateTemp("", "bluesoft-*.xlsx")
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	size, _ := io.Copy(tmp, file)
+	tmp.Close()
+
+	produtos, avisos, formato, err := lerPlanilha(tmp.Name())
+	if err != nil {
+		os.Remove(tmp.Name())
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+		return
+	}
+
+	sess := &FileSession{
+		ID:        novoID(),
+		Filename:  header.Filename,
+		Size:      size,
+		Path:      tmp.Name(),
+		Formato:   formato,
+		Produtos:  produtos,
+		Avisos:    avisos,
+		CreatedAt: time.Now(),
+	}
+	sessoes.Store(sess.ID, sess)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"id":       sess.ID,
+		"filename": sess.Filename,
+		"size":     sess.Size,
+		"formato":  formato,
+		"linhas":   len(produtos),
+		"avisos":   avisos,
+	})
+}
+
+// runOpcoes é o body comum de /api/run e /api/retry.
+type runOpcoes struct {
+	ID              string `json:"id"`
+	LinhaCompra     bool   `json:"linhaCompra"`
+	LinhaCompraCD   bool   `json:"linhaCompraCD"`
+	LinhaLoja       bool   `json:"linhaLoja"`
+	AlterarNCM      bool   `json:"alterarNCM"`
+	PreTransferencia bool  `json:"preTransferencia"`
+	CdTipo          string `json:"cdTipo"`
+	LojaOrigem      int    `json:"lojaOrigem"` // só usado quando formato=ficha + PT
+	Linhas          []int  `json:"linhas,omitempty"` // só usado em /api/retry
+}
+
+func handleRun(w http.ResponseWriter, r *http.Request) {
+	executaSSE(w, r, false)
+}
+
+func handleRetry(w http.ResponseWriter, r *http.Request) {
+	executaSSE(w, r, true)
+}
+
+func executaSSE(w http.ResponseWriter, r *http.Request, isRetry bool) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req runOpcoes
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if req.CdTipo == "" {
+		req.CdTipo = "UN"
+	}
+	if !req.LinhaCompra && !req.LinhaCompraCD && !req.LinhaLoja && !req.AlterarNCM && !req.PreTransferencia {
+		http.Error(w, "selecione ao menos uma operação", 400)
+		return
+	}
+	// Pré-transferência é exclusiva (não combina com as outras ops no mesmo run).
+	if req.PreTransferencia && (req.LinhaCompra || req.LinhaCompraCD || req.LinhaLoja || req.AlterarNCM) {
+		http.Error(w, "Pré-transferência roda sozinha — desmarque as outras operações", 400)
+		return
+	}
+	val, ok := sessoes.Load(req.ID)
+	if !ok {
+		http.Error(w, "sessão não encontrada — recarregue o arquivo", 404)
+		return
+	}
+	sess := val.(*FileSession)
+	// Modelo PT só aceita Pré-transferência.
+	if sess.Formato == "pt" && !req.PreTransferencia {
+		http.Error(w, "essa planilha só suporta Pré-transferência", 400)
+		return
+	}
+	// Ficha + PT exige loja origem.
+	if req.PreTransferencia && sess.Formato == "ficha" && req.LojaOrigem == 0 {
+		http.Error(w, "informe a loja origem para Pré-transferência na ficha de cadastro", 400)
+		return
+	}
+
+	// Filtra produtos pelas linhas pedidas (só no retry).
+	produtos := sess.Produtos
+	if isRetry && len(req.Linhas) > 0 {
+		set := make(map[int]bool, len(req.Linhas))
+		for _, l := range req.Linhas {
+			set[l] = true
+		}
+		filtrados := make([]ProdutoLinha, 0, len(req.Linhas))
+		for _, p := range sess.Produtos {
+			if set[p.LinhaPlanilha] {
+				filtrados = append(filtrados, p)
+			}
+		}
+		produtos = filtrados
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	flusher, fok := w.(http.Flusher)
+	if !fok {
 		http.Error(w, "streaming não suportado", 500)
 		return
 	}
@@ -718,126 +1279,113 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	defer rl.close()
 
 	var sendMu sync.Mutex
-	send := func(tipo, msg string) {
+	emit := func(evt EventoSSE) {
 		sendMu.Lock()
 		defer sendMu.Unlock()
-		b, _ := json.Marshal(LogEntry{Tipo: tipo, Mensagem: msg})
+		b, _ := json.Marshal(evt)
 		fmt.Fprintf(w, "data: %s\n\n", b)
 		flusher.Flush()
-		rl.event(tipo, msg)
+		rl.event(evt.Tipo, evt.Mensagem)
 	}
+	emitInfo := func(msg string) { emit(EventoSSE{Tipo: "info", Mensagem: msg}) }
+
 	if rl != nil {
 		rl.writeln("───── Início do upload ─────")
-		rl.writeln("Arquivo de log: %s", rl.path)
+		rl.writeln("Arquivo: %s", sess.Filename)
+		rl.writeln("Log: %s", rl.path)
 	}
 
-	// (Re)inicializa o canal de cancelamento para esta sessão de upload.
 	cancelMu.Lock()
 	cancelChan = make(chan struct{})
 	localCancel := cancelChan
 	cancelMu.Unlock()
 
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		send("erro", "Erro ao ler form: "+err.Error())
-		send("fim", "")
+	tenant := os.Getenv("BLUESOFT_TENANT")
+	clientID := os.Getenv("client_id")
+	clientSecret := os.Getenv("client_secret")
+	if tenant == "" || clientID == "" || clientSecret == "" {
+		emit(EventoSSE{Tipo: "erro", Mensagem: "credenciais ausentes — configure em /setup"})
+		emit(EventoSSE{Tipo: "fim", Mensagem: ""})
 		return
 	}
 
-	tenant            := r.FormValue("tenant")
-	clientID          := r.FormValue("clientId")
-	clientSecret      := r.FormValue("clientSecret")
-	fazerLC           := r.FormValue("linhaCompra") == "true"
-	fazerLCCD         := r.FormValue("linhaCompraCD") == "true"
-	fazerLL           := r.FormValue("linhaLoja") == "true"
-	fazerNCM          := r.FormValue("alterarNCM") == "true"
-	cdTipo            := r.FormValue("cdTipo")
-	if cdTipo == "" {
-		cdTipo = "UN"
-	}
-
-	if !fazerLC && !fazerLCCD && !fazerLL && !fazerNCM {
-		send("erro", "Selecione pelo menos uma operação")
-		send("fim", "")
-		return
-	}
-
-	file, _, err := r.FormFile("file")
-	if err != nil {
-		send("erro", "Arquivo não recebido: "+err.Error())
-		send("fim", "")
-		return
-	}
-	defer file.Close()
-
-	tmp, err := os.CreateTemp("", "bluesoft-*.xlsx")
-	if err != nil {
-		send("erro", "Erro ao criar arquivo temporário")
-		send("fim", "")
-		return
-	}
-	defer os.Remove(tmp.Name())
-	io.Copy(tmp, file)
-	tmp.Close()
-
-	send("info", "🔐 Autenticando...")
+	emitInfo("🔐 Autenticando…")
 	token, err := obterToken(tenant, clientID, clientSecret)
 	if err != nil {
-		send("erro", "❌ Falha na autenticação: "+err.Error())
-		send("fim", "")
+		emit(EventoSSE{Tipo: "erro", Mensagem: "falha na autenticação: " + err.Error()})
+		emit(EventoSSE{Tipo: "fim", Mensagem: ""})
 		return
 	}
-	send("ok", "✅ Autenticado com sucesso")
-
-	send("info", "📄 Lendo planilha...")
-	produtos, err := lerPlanilha(tmp.Name())
-	if err != nil {
-		send("erro", "❌ Erro ao ler planilha: "+err.Error())
-		send("fim", "")
-		return
-	}
-	send("info", fmt.Sprintf("📋 %d produtos encontrados. Iniciando envio...", len(produtos)))
+	emit(EventoSSE{Tipo: "ok", Op: "Auth", Mensagem: "autenticado"})
 
 	ops := []string{}
-	if fazerNCM  { ops = append(ops, "Alterar NCM") }
-	if fazerLC   { ops = append(ops, "Linha Compra") }
-	if fazerLL   { ops = append(ops, "Linha Loja") }
-	if fazerLCCD { ops = append(ops, "Linha Compra CD ("+cdTipo+")") }
-	send("info", "Operações: "+strings.Join(ops, " | "))
+	if req.AlterarNCM { ops = append(ops, "Alterar NCM") }
+	if req.LinhaCompra { ops = append(ops, "Linha Compra") }
+	if req.LinhaLoja { ops = append(ops, "Sortimento") }
+	if req.LinhaCompraCD { ops = append(ops, "Linha CD ("+req.CdTipo+")") }
+	if req.PreTransferencia { ops = append(ops, "Pré-transferência") }
+	emitInfo("Operações: " + strings.Join(ops, " · "))
+	emitInfo(fmt.Sprintf("Processando %d linhas…", len(produtos)))
 
-	var okCount, errCount atomic.Int32
-	cancelado := false
-	for i, p := range produtos {
-		select {
-		case <-localCancel:
-			send("aviso", "⛔ Processamento cancelado pelo usuário.")
-			cancelado = true
-		default:
+	var okCount, errCount, warnCount atomic.Int32
+	emitContando := func(evt EventoSSE) {
+		emit(evt)
+		switch evt.Tipo {
+		case "ok":
+			okCount.Add(1)
+		case "erro":
+			errCount.Add(1)
+		case "aviso":
+			warnCount.Add(1)
 		}
-		if cancelado {
-			break
-		}
+	}
 
-		processarProduto(tenant, token, p, fazerLC, fazerLCCD, fazerLL, fazerNCM, cdTipo, rl,
-			func(tipo, msg string) {
-				send(tipo, msg)
-				if tipo == "ok" {
-					okCount.Add(1)
-				} else if tipo == "erro" {
-					errCount.Add(1)
-				}
-			},
-		)
+	var preTransfKeys []int
+	if req.PreTransferencia {
+		preTransfKeys = processarPreTransferencia(tenant, token, sess.Formato, produtos, req.LojaOrigem, rl, emitContando, localCancel)
+		// PT não tem progresso por linha — manda 1/1 só pra UI completar a barra.
 		sendMu.Lock()
-		prog := map[string]any{"atual": i + 1, "total": len(produtos)}
+		prog := map[string]any{"atual": 1, "total": 1}
 		b, _ := json.Marshal(prog)
 		fmt.Fprintf(w, "event: progress\ndata: %s\n\n", b)
 		flusher.Flush()
 		sendMu.Unlock()
+	} else {
+		cancelado := false
+		for i, p := range produtos {
+			select {
+			case <-localCancel:
+				emit(EventoSSE{Tipo: "aviso", Mensagem: "⛔ cancelado pelo usuário"})
+				cancelado = true
+			default:
+			}
+			if cancelado {
+				break
+			}
+			processarProduto(tenant, token, p,
+				req.LinhaCompra, req.LinhaCompraCD, req.LinhaLoja, req.AlterarNCM,
+				req.CdTipo, rl,
+				emitContando,
+			)
+			sendMu.Lock()
+			prog := map[string]any{"atual": i + 1, "total": len(produtos)}
+			b, _ := json.Marshal(prog)
+			fmt.Fprintf(w, "event: progress\ndata: %s\n\n", b)
+			flusher.Flush()
+			sendMu.Unlock()
+		}
 	}
 
-	send("info", "─────────────────────────────────")
-	send("info", fmt.Sprintf("Concluído: %d ✅  |  %d ❌", okCount.Load(), errCount.Load()))
-	send("fim", fmt.Sprintf(`{"ok":%d,"erros":%d}`, okCount.Load(), errCount.Load()))
+	resumo := map[string]any{
+		"ok":     okCount.Load(),
+		"erros":  errCount.Load(),
+		"avisos": warnCount.Load(),
+	}
+	if len(preTransfKeys) > 0 {
+		resumo["preTransferenciaKeys"] = preTransfKeys
+	}
+	rb, _ := json.Marshal(resumo)
+	emit(EventoSSE{Tipo: "fim", Mensagem: string(rb)})
 }
 
 func handleCancel(w http.ResponseWriter, r *http.Request) {
@@ -872,21 +1420,13 @@ func handleAbrirLogs(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"path": dir})
 }
 
-func handleEnv(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"tenant":   os.Getenv("BLUESOFT_TENANT"),
-		"clientId": os.Getenv("client_id"),
-	})
-}
-
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(htmlUI))
 }
 
 func main() {
-	godotenv.Load()
+	godotenv.Load(envPath())
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		log.Fatal("Não foi possível abrir porta:", err)
@@ -894,8 +1434,12 @@ func main() {
 	port := ln.Addr().(*net.TCPAddr).Port
 	addr := fmt.Sprintf("http://127.0.0.1:%d", port)
 	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/api/env", handleEnv)
+	http.HandleFunc("/api/setup", handleSetup)
+	http.HandleFunc("/api/setup/test", handleSetupTest)
+	http.HandleFunc("/api/setup/save", handleSetupSave)
 	http.HandleFunc("/api/upload", handleUpload)
+	http.HandleFunc("/api/run", handleRun)
+	http.HandleFunc("/api/retry", handleRetry)
 	http.HandleFunc("/api/cancel", handleCancel)
 	http.HandleFunc("/api/abrir-logs", handleAbrirLogs)
 	go func() {
