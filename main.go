@@ -766,6 +766,19 @@ func processarProduto(
 		emit(EventoSSE{Tipo: tipo, Op: op, Mensagem: msg, EAN: produto.EAN, Linha: produto.LinhaPlanilha})
 	}
 
+	// Lojas 3 e 306 são sempre obrigatórias em operações não-PT.
+	if fazerLinhaCompra || fazerLinhaCompraCD || fazerLinhaLoja || fazerNCM {
+		existentes := make(map[int]struct{}, len(produto.Lojas))
+		for _, l := range produto.Lojas {
+			existentes[l] = struct{}{}
+		}
+		for _, l := range []int{3, 306} {
+			if _, ok := existentes[l]; !ok {
+				produto.Lojas = append(produto.Lojas, l)
+			}
+		}
+	}
+
 	// Operações de loja exigem ao menos uma loja na planilha.
 	exigeLojas := fazerLinhaCompra || fazerLinhaCompraCD || fazerLinhaLoja
 	if exigeLojas && len(produto.Lojas) == 0 {
@@ -1367,6 +1380,17 @@ func executaSSE(w http.ResponseWriter, r *http.Request, isRetry bool) {
 		sendMu.Unlock()
 	} else {
 		cancelado := false
+		// Linha de Compra deve estar 100% concluída antes de CD e Loja (o sistema
+		// só aceita sortimento/CD após o produto já ter linha de compra em todas as lojas).
+		needsTwoPasses := req.LinhaCompra && (req.LinhaCompraCD || req.LinhaLoja)
+		totalSteps := len(produtos)
+		if needsTwoPasses {
+			totalSteps = len(produtos) * 2
+		}
+		// Quando não há dois passes, CD e Loja correm normalmente no único passe.
+		passOneCD := !needsTwoPasses && req.LinhaCompraCD
+		passOneLoja := !needsTwoPasses && req.LinhaLoja
+
 		for i, p := range produtos {
 			select {
 			case <-localCancel:
@@ -1378,16 +1402,40 @@ func executaSSE(w http.ResponseWriter, r *http.Request, isRetry bool) {
 				break
 			}
 			processarProduto(tenant, token, p,
-				req.LinhaCompra, req.LinhaCompraCD, req.LinhaLoja, req.AlterarNCM,
-				req.CdTipo, rl,
-				emitContando,
+				req.LinhaCompra, passOneCD, passOneLoja, req.AlterarNCM,
+				req.CdTipo, rl, emitContando,
 			)
 			sendMu.Lock()
-			prog := map[string]any{"atual": i + 1, "total": len(produtos)}
+			prog := map[string]any{"atual": i + 1, "total": totalSteps}
 			b, _ := json.Marshal(prog)
 			fmt.Fprintf(w, "event: progress\ndata: %s\n\n", b)
 			flusher.Flush()
 			sendMu.Unlock()
+		}
+
+		if !cancelado && needsTwoPasses {
+			emit(EventoSSE{Tipo: "info", Mensagem: "Linha de Compra concluída — iniciando Sortimento e Linha CD…"})
+			for i, p := range produtos {
+				select {
+				case <-localCancel:
+					emit(EventoSSE{Tipo: "aviso", Mensagem: "⛔ cancelado pelo usuário"})
+					cancelado = true
+				default:
+				}
+				if cancelado {
+					break
+				}
+				processarProduto(tenant, token, p,
+					false, req.LinhaCompraCD, req.LinhaLoja, false,
+					req.CdTipo, rl, emitContando,
+				)
+				sendMu.Lock()
+				prog := map[string]any{"atual": len(produtos) + i + 1, "total": totalSteps}
+				b, _ := json.Marshal(prog)
+				fmt.Fprintf(w, "event: progress\ndata: %s\n\n", b)
+				flusher.Flush()
+				sendMu.Unlock()
+			}
 		}
 	}
 
