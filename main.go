@@ -27,7 +27,7 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
-const version = "1.0.2"
+const version = "1.1.0"
 
 // ─── Payloads ────────────────────────────────────────────────────────────────
 
@@ -1499,6 +1499,9 @@ func abrirNavegador(u string) {
 	}
 }
 
+// needsRestart é setado para 1 quando updater() instala uma nova versão.
+var needsRestart int32
+
 func updater() {
 	v := semver.MustParse(version)
 	latest, err := selfupdate.UpdateSelf(v, "MateusLDK/helper") // Seu repo
@@ -1512,7 +1515,15 @@ func updater() {
 	} else {
 		log.Printf("🔄 Atualizado de %s para %s!", version, latest.Version)
 		log.Println("Reinicie o programa para usar a nova versão")
+		atomic.StoreInt32(&needsRestart, 1)
 	}
+}
+
+func handleStatus(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"needsRestart": atomic.LoadInt32(&needsRestart) == 1,
+	})
 }
 
 func main() {
@@ -1528,6 +1539,7 @@ func main() {
 	http.HandleFunc("/api/setup", handleSetup)
 	http.HandleFunc("/api/setup/test", handleSetupTest)
 	http.HandleFunc("/api/setup/save", handleSetupSave)
+	http.HandleFunc("/api/status", handleStatus)
 	http.HandleFunc("/api/upload", handleUpload)
 	http.HandleFunc("/api/run", handleRun)
 	http.HandleFunc("/api/retry", handleRetry)

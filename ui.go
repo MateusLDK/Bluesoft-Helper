@@ -713,6 +713,40 @@ var htmlUI = `<!DOCTYPE html>
   }
   .pt-keys-card .key-pill .key-icon { font-size: 12px; opacity: .7; }
 
+  /* ── Restart overlay ────────────────────────────────── */
+  #restartOverlay {
+    position: fixed; inset: 0; z-index: 9999;
+    background: rgba(10,13,18,0.93);
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(4px);
+  }
+  #restartOverlay.hidden { display: none !important; }
+  .restart-card {
+    background: var(--bg-2);
+    border: 1px solid rgba(251,191,36,0.35);
+    border-radius: var(--r-2xl);
+    padding: 40px 44px;
+    max-width: 440px; width: 90%;
+    text-align: center;
+    display: flex; flex-direction: column; align-items: center; gap: 16px;
+    box-shadow: 0 0 60px rgba(251,191,36,0.08);
+  }
+  .restart-icon {
+    width: 52px; height: 52px; border-radius: 50%;
+    background: var(--amber-bg);
+    border: 1px solid rgba(251,191,36,0.35);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+  }
+  .restart-card h2 { font-size: 18px; font-weight: 600; letter-spacing: -.2px; }
+  .restart-card p  { font-size: 13px; color: var(--text-dim); line-height: 1.6; }
+  .restart-badge {
+    font-family: var(--font-mono); font-size: 11px;
+    padding: 4px 14px; border-radius: 99px;
+    background: var(--bg-3); color: var(--amber);
+    border: 1px solid rgba(251,191,36,0.20);
+  }
+
   /* hidden util */
   .hidden { display: none !important; }
 </style>
@@ -993,6 +1027,17 @@ var htmlUI = `<!DOCTYPE html>
 
 </main>
 
+<!-- ─── RESTART OVERLAY ─── -->
+<div id="restartOverlay" class="hidden">
+  <div class="restart-card">
+    <div class="restart-icon">↑</div>
+    <h2>Atualização instalada</h2>
+    <p>Uma nova versão foi instalada com sucesso. Feche e reabra o programa para aplicar a atualização.</p>
+    <span class="restart-badge">reinício necessário</span>
+    <p style="font-size:11px;color:var(--text-faint)">Esta janela permanecerá bloqueada até o programa ser reiniciado.</p>
+  </div>
+</div>
+
 <script>
 // ───────────────────────────────────────────────────────────
 // State machine
@@ -1036,8 +1081,13 @@ function setTenantPill(t) {
 // ───────────────────────────────────────────────────────────
 async function boot() {
   try {
-    const r = await fetch('/api/setup')
-    const d = await r.json()
+    const [setupResp, statusResp] = await Promise.all([fetch('/api/setup'), fetch('/api/status')])
+    const status = await statusResp.json()
+    if (status.needsRestart) {
+      document.getElementById('restartOverlay').classList.remove('hidden')
+      return
+    }
+    const d = await setupResp.json()
     state.configured = !!d.configured
     setTenantPill(d.tenant || '')
     if (!state.configured) {
