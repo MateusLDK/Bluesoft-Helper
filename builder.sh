@@ -9,15 +9,18 @@ mkdir -p dist
 
 # Windows
 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o "dist/${APP_NAME}_windows_amd64.exe" .
+(cd dist && zip "${APP_NAME}_windows_amd64.zip" "${APP_NAME}_windows_amd64.exe" && rm "${APP_NAME}_windows_amd64.exe")
 
 # Linux
 for arch in amd64 arm64; do
     GOOS=linux GOARCH=$arch go build -ldflags="-s -w" -o "dist/${APP_NAME}_linux_$arch" .
+    (cd dist && tar czf "${APP_NAME}_linux_${arch}.tar.gz" "${APP_NAME}_linux_${arch}" && rm "${APP_NAME}_linux_${arch}")
 done
 
 # macOS
 for arch in amd64 arm64; do
     GOOS=darwin GOARCH=$arch go build -ldflags="-s -w" -o "dist/${APP_NAME}_darwin_$arch" .
+    (cd dist && tar czf "${APP_NAME}_darwin_${arch}.tar.gz" "${APP_NAME}_darwin_${arch}" && rm "${APP_NAME}_darwin_${arch}")
 done
 
 echo "✅ Gerado"

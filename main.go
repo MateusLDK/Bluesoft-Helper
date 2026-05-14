@@ -1,7 +1,10 @@
 package main
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -22,8 +25,8 @@ import (
 	"time"
 
 	"github.com/blang/semver"
+	"github.com/inconshreveable/go-update"
 	"github.com/joho/godotenv"
-	"github.com/rhysd/go-github-selfupdate/selfupdate"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -1503,20 +1506,120 @@ func abrirNavegador(u string) {
 var needsRestart int32
 
 func updater() {
-	v := semver.MustParse(version)
-	latest, err := selfupdate.UpdateSelf(v, "MateusLDK/helper") // Seu repo
+	current := semver.MustParse(version)
+
+	type ghAsset struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	}
+	type ghRelease struct {
+		TagName string    `json:"tag_name"`
+		Assets  []ghAsset `json:"assets"`
+	}
+
+	resp, err := http.Get("https://api.github.com/repos/MateusLDK/helper/releases/latest")
 	if err != nil {
 		log.Println("Erro ao verificar atualização:", err)
 		return
 	}
+	defer resp.Body.Close()
 
-	if latest.Version.Equals(v) {
-		log.Println("✅ Já está na última versão:", version)
-	} else {
-		log.Printf("🔄 Atualizado de %s para %s!", version, latest.Version)
-		log.Println("Reinicie o programa para usar a nova versão")
-		atomic.StoreInt32(&needsRestart, 1)
+	var rel ghRelease
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		log.Println("Erro ao verificar atualização:", err)
+		return
 	}
+
+	tag := strings.TrimPrefix(strings.TrimPrefix(rel.TagName, "v"), "V")
+	latest, err := semver.ParseTolerant(tag)
+	if err != nil {
+		log.Println("Erro ao verificar atualização:", err)
+		return
+	}
+	if !latest.GT(current) {
+		log.Println("✅ Já está na última versão:", version)
+		return
+	}
+
+	ext := ".tar.gz"
+	if runtime.GOOS == "windows" {
+		ext = ".zip"
+	}
+	assetName := fmt.Sprintf("Helper_%s_%s%s", runtime.GOOS, runtime.GOARCH, ext)
+
+	var downloadURL string
+	for _, a := range rel.Assets {
+		if a.Name == assetName {
+			downloadURL = a.BrowserDownloadURL
+			break
+		}
+	}
+	if downloadURL == "" {
+		log.Println("Erro ao verificar atualização: asset não encontrado:", assetName)
+		return
+	}
+
+	// DisableCompression evita que o http.Client descomprima automaticamente o .tar.gz
+	dlClient := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+	dlResp, err := dlClient.Get(downloadURL)
+	if err != nil {
+		log.Println("Erro ao baixar atualização:", err)
+		return
+	}
+	defer dlResp.Body.Close()
+
+	var binary io.Reader
+	if runtime.GOOS == "windows" {
+		data, err := io.ReadAll(dlResp.Body)
+		if err != nil {
+			log.Println("Erro ao baixar atualização:", err)
+			return
+		}
+		zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			log.Println("Erro ao descompactar atualização:", err)
+			return
+		}
+		for _, f := range zr.File {
+			if strings.HasSuffix(f.Name, ".exe") {
+				rc, err := f.Open()
+				if err != nil {
+					log.Println("Erro ao descompactar atualização:", err)
+					return
+				}
+				defer rc.Close()
+				binary = rc
+				break
+			}
+		}
+	} else {
+		gz, err := gzip.NewReader(dlResp.Body)
+		if err != nil {
+			log.Println("Erro ao descompactar atualização:", err)
+			return
+		}
+		defer gz.Close()
+		tr := tar.NewReader(gz)
+		if _, err := tr.Next(); err != nil {
+			log.Println("Erro ao descompactar atualização:", err)
+			return
+		}
+		binary = tr
+	}
+
+	if binary == nil {
+		log.Println("Erro ao atualizar: binário não encontrado no arquivo")
+		return
+	}
+
+	if err := update.Apply(binary, update.Options{}); err != nil {
+		log.Println("Erro ao aplicar atualização:", err)
+		return
+	}
+
+	log.Printf("🔄 Atualizado de %s para %s!", version, latest)
+	log.Println("Reinicie o programa para usar a nova versão")
+	atomic.StoreInt32(&needsRestart, 1)
 }
 
 func handleStatus(w http.ResponseWriter, _ *http.Request) {
