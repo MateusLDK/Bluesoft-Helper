@@ -847,7 +847,10 @@ func processarProduto(
 					ProdutoKey:    infoUN.ProdutoKey,
 					LojaKey:       l,
 				}
+				pb, _ := json.Marshal(payload)
+				log.Printf("[Compra] EAN %s | loja %d | payload=%s", produto.EAN, l, pb)
 				status, body, err := postAPI(token, ep, payload)
+				log.Printf("[Compra] EAN %s | loja %d | status=%d | body=%s", produto.EAN, l, status, body)
 				rl.httpCall(fmt.Sprintf("Compra | EAN %s (produto %d) | loja %d", produto.EAN, infoUN.ProdutoKey, l), "POST", ep, payload, status, body, err)
 				if err != nil || (status != 200 && status != 201) {
 					send("erro", op, fmt.Sprintf("EAN %s loja %d — %s", produto.EAN, l, apiErrMsg(status, body, err)))
