@@ -115,6 +115,8 @@ O app Go encaminha o arquivo para o serviço de fotos (`POST /processar-fotos`).
 > A URL do serviço usada pelo app está em `fotosVMURL` (`main.go`). Ajuste se o serviço rodar em outro host/porta.
 
 > **Um único serviço atende vários helpers.** Não é necessário que cada máquina suba o seu — basta ter uma instância rodando (ex: numa VM) e apontar o `fotosVMURL` de todos os apps para ela.
+>
+> O S3 e o banco são os **do host que roda o serviço** (configurados no `.env` dele). Todos os helpers que apontam para esse serviço sobem as fotos no **mesmo bucket** e consultam o **mesmo banco**. Ou seja: quem não tem S3/banco configurado em lugar nenhum não consegue importar fotos — é preciso ter ao menos um host com essas credenciais.
 
 ### Rodar o serviço de fotos
 
