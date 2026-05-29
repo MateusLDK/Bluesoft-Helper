@@ -769,6 +769,35 @@ var htmlUI = `<!DOCTYPE html>
     border: 1px solid rgba(251,191,36,0.20);
   }
 
+  /* ── Fotos processing overlay ───────────────────────── */
+  #fotosOverlay {
+    position: fixed; inset: 0; z-index: 9998;
+    background: rgba(10,13,18,0.93);
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(4px);
+  }
+  #fotosOverlay.hidden { display: none !important; }
+  .fotos-overlay-card {
+    background: var(--bg-2);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-2xl);
+    padding: 40px 44px;
+    max-width: 440px; width: 90%;
+    text-align: center;
+    display: flex; flex-direction: column; align-items: center; gap: 16px;
+    box-shadow: 0 0 60px rgba(90,200,250,0.08);
+  }
+  .fotos-spinner {
+    width: 44px; height: 44px;
+    border-radius: 50%;
+    border: 3px solid var(--bg-3);
+    border-top-color: var(--accent);
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .fotos-overlay-card h2 { font-size: 18px; font-weight: 600; letter-spacing: -.2px; }
+  .fotos-overlay-card p  { font-size: 13px; color: var(--text-dim); line-height: 1.6; }
+
   /* hidden util */
   .hidden { display: none !important; }
 </style>
@@ -1063,6 +1092,14 @@ var htmlUI = `<!DOCTYPE html>
 </main>
 
 <!-- ─── RESTART OVERLAY ─── -->
+<div id="fotosOverlay" class="hidden">
+  <div class="fotos-overlay-card">
+    <div class="fotos-spinner"></div>
+    <h2>Aguarde, processando…</h2>
+    <p>Enviando as fotos e consultando o banco. Isso pode levar alguns instantes — não feche o programa.</p>
+  </div>
+</div>
+
 <div id="restartOverlay" class="hidden">
   <div class="restart-card">
     <div class="restart-icon">↑</div>
@@ -1342,8 +1379,10 @@ async function uploadFotosInline(file) {
   }
   const statusEl = document.getElementById('fotosStatusIdle')
   statusEl.style.display = 'block'
-  statusEl.innerHTML = '<span style="color:var(--text-dim)">Enviando...</span>'
+  statusEl.innerHTML = ''
   document.getElementById('fileInput').value = ''
+  const overlay = document.getElementById('fotosOverlay')
+  overlay.classList.remove('hidden')
   try {
     const fd = new FormData()
     fd.append('arquivo', file)
@@ -1370,6 +1409,8 @@ async function uploadFotosInline(file) {
     statusEl.innerHTML = html
   } catch (e) {
     statusEl.innerHTML = '<span style="color:var(--red)">' + escapeHtml(e.message) + '</span>'
+  } finally {
+    overlay.classList.add('hidden')
   }
 }
 
