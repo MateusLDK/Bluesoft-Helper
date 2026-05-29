@@ -1,10 +1,8 @@
 import csv
 import os
 import shutil
-import subprocess
 import tempfile
 import zipfile
-from time import sleep
 
 import boto3
 import psycopg2
@@ -14,32 +12,6 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 load_dotenv()
-
-
-def conectarVPN():
-    if os.getenv("SKIP_VPN", "false").lower() == "true":
-        print("SKIP_VPN=true, pulando conexão VPN")
-        return
-    print("Conectando ao VPN")
-    subprocess.Popen(
-        [
-            "sudo",
-            "openvpn",
-            "--config",
-            "vpn.ovpn",
-            "--daemon",
-        ],
-    )
-    sleep(15)
-    print("VPN conectada com sucesso")
-
-
-def desconectarVPN():
-    if os.getenv("SKIP_VPN", "false").lower() == "true":
-        return
-    print("Desconectando do VPN")
-    subprocess.Popen(["sudo", "pkill", "openvpn"])
-
 
 app = FastAPI()
 
@@ -188,12 +160,4 @@ def health():
 if __name__ == "__main__":
     import uvicorn
 
-    try:
-        conectarVPN()
-        uvicorn.run(app, host="0.0.0.0", port=8000)
-
-    except Exception as e:
-        print(e)
-
-    finally:
-        desconectarVPN()
+    uvicorn.run(app, host="0.0.0.0", port=8000)
