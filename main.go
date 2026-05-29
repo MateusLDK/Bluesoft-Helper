@@ -1623,8 +1623,14 @@ func updater() {
 		return
 	}
 
-	// DisableCompression evita que o http.Client descomprima automaticamente o .tar.gz
-	dlClient := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+	var dlClient *http.Client
+	if runtime.GOOS == "windows" {
+		// Windows usa .zip — deixa o http.Client descomprimir normalmente
+		dlClient = &http.Client{}
+	} else {
+		// DisableCompression evita que o http.Client descomprima automaticamente o .tar.gz
+		dlClient = &http.Client{Transport: &http.Transport{DisableCompression: true}}
+	}
 	dlResp, err := dlClient.Get(downloadURL)
 	if err != nil {
 		log.Println("Erro ao baixar atualização:", err)
