@@ -31,7 +31,7 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
-const version = "1.1.0"
+const version = "1.2.0"
 
 const fotosVMURL = "http://192.168.0.25:8000/processar-fotos"
 

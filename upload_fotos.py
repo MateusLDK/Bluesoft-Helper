@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 import psycopg2
@@ -28,6 +29,8 @@ S3_PREFIX = os.getenv("S3_PREFIX", "fotos-bluesoft/")
 S3_REGION = os.getenv("S3_REGION", "us-east-1")
 
 EXTENSOES = (".jpg", ".jpeg", ".png", ".webp")
+
+S3_MAX_WORKERS = int(os.getenv("S3_MAX_WORKERS", "10"))
 
 
 @app.post("/processar-fotos")
@@ -74,59 +77,80 @@ async def processar_fotos(arquivo: UploadFile = File(...)):
         nao_encontrados = []
         uploadados = []
 
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f, delimiter=";")
-            writer.writerow(["gtin", "url"])
+        # 1) coleta todas as fotos válidas antes de consultar o banco
+        fotos = []
+        for root, dirs, files in os.walk(fotos_dir):
+            for arquivo_foto in sorted(files):
+                if not arquivo_foto.lower().endswith(EXTENSOES):
+                    continue
+                fotos.append(
+                    {
+                        "caminho": os.path.join(root, arquivo_foto),
+                        "arquivo_foto": arquivo_foto,
+                        "nome_sem_extensao": os.path.splitext(arquivo_foto)[0],
+                    }
+                )
 
-            for root, dirs, files in os.walk(fotos_dir):
-                for arquivo_foto in sorted(files):
-                    print(arquivo_foto)
-                    if not arquivo_foto.lower().endswith(EXTENSOES):
-                        continue
-                    caminho = os.path.join(root, arquivo_foto)
-                    nome_sem_extensao = os.path.splitext(arquivo_foto)[0]
-
-                    cur.execute(
-                        "SELECT produto_key FROM fornecedor_produto WHERE codigo_referencia = %s",
-                        (nome_sem_extensao,),
-                    )
-                    row = cur.fetchone()
-                    if row is None:
-                        nao_encontrados.append(arquivo_foto)
-                        continue
-                    produto_key = row[0]
-
-                    cur.execute(
-                        "SELECT gtin_principal FROM produto_d WHERE produto_key = %s",
-                        (produto_key,),
-                    )
-                    row = cur.fetchone()
-                    if row is None:
-                        nao_encontrados.append(arquivo_foto)
-                        continue
-
-                    gtin = row[0]
-                    caminho = os.path.join(root, arquivo_foto)  # CORRETO
-                    key = f"{S3_PREFIX}{arquivo_foto}"
-                    ct = (
-                        "image/jpeg"
-                        if arquivo_foto.lower().endswith((".jpg", ".jpeg"))
-                        else "image/png"
-                    )
-                    print(f"Enviando imagem do item: {gtin}")
-
-                    try:
-                        s3.upload_file(
-                            caminho, S3_BUCKET, key, ExtraArgs={"ContentType": ct}
-                        )
-                        url = f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
-                        uploadados.append(key)
-                        writer.writerow([gtin, url])
-                    except Exception as e:
-                        print(f"Erro ao enviar imagem do item {gtin}: {str(e)}")
+        # 2) uma query só: resolve os gtins de todas as referências de uma vez
+        referencias = list({f["nome_sem_extensao"] for f in fotos})
+        cur.execute(
+            """
+            SELECT fp.codigo_referencia, pd.gtin_principal
+            FROM fornecedor_produto fp
+            JOIN produto_d pd ON pd.produto_key = fp.produto_key
+            WHERE fp.codigo_referencia = ANY(%s)
+            """,
+            (referencias,),
+        )
+        gtin_por_ref = {ref: gtin for ref, gtin in cur.fetchall()}
 
         cur.close()
         conn.close()
+
+        # 3) upload paralelo no S3
+        def enviar(foto):
+            arquivo_foto = foto["arquivo_foto"]
+            gtin = gtin_por_ref[foto["nome_sem_extensao"]]
+            key = f"{S3_PREFIX}{arquivo_foto}"
+            ct = (
+                "image/jpeg"
+                if arquivo_foto.lower().endswith((".jpg", ".jpeg"))
+                else "image/png"
+            )
+            print(f"Enviando imagem do item: {gtin}")
+            s3.upload_file(
+                foto["caminho"], S3_BUCKET, key, ExtraArgs={"ContentType": ct}
+            )
+            url = f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
+            return arquivo_foto, key, gtin, url
+
+        a_enviar = []
+        for foto in fotos:
+            if foto["nome_sem_extensao"] not in gtin_por_ref:
+                nao_encontrados.append(foto["arquivo_foto"])
+            else:
+                a_enviar.append(foto)
+
+        linhas = []
+        with ThreadPoolExecutor(max_workers=S3_MAX_WORKERS) as executor:
+            futures = {executor.submit(enviar, foto): foto for foto in a_enviar}
+            for future in as_completed(futures):
+                foto = futures[future]
+                try:
+                    arquivo_foto, key, gtin, url = future.result()
+                    uploadados.append(key)
+                    linhas.append((arquivo_foto, gtin, url))
+                except Exception as e:
+                    gtin = gtin_por_ref.get(foto["nome_sem_extensao"])
+                    print(f"Erro ao enviar imagem do item {gtin}: {str(e)}")
+
+        # 4) escreve o CSV depois (csv.writer não é thread-safe), em ordem estável
+        linhas.sort(key=lambda linha: linha[0])
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow(["gtin", "url"])
+            for _, gtin, url in linhas:
+                writer.writerow([gtin, url])
 
         headers = {}
         if nao_encontrados:
