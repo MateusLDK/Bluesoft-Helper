@@ -153,3 +153,15 @@ AWS_SECRET_ACCESS_KEY=
 # nº de uploads simultâneos para o S3 (padrão: 10)
 S3_MAX_WORKERS=10
 ```
+
+### Limpeza do bucket (`limpar_bucket.py`)
+
+As fotos enviadas servem como hospedagem temporária para a importação no Bluesoft, então não precisam ficar no S3 para sempre. O `limpar_bucket.py` apaga do bucket (dentro do `S3_PREFIX`) todos os objetos com **mais de 24h**:
+
+```bash
+python limpar_bucket.py
+```
+
+Usa o mesmo `.env` do serviço de fotos (`S3_BUCKET`, `S3_PREFIX`, `S3_REGION` e credenciais AWS). A idade de corte está fixa em `IDADE_HORAS = 24` no script. Ideal rodar periodicamente — por exemplo, num cron diário no host que mantém o serviço de fotos.
+
+> ⚠️ **Os links do CSV são temporários.** As URLs geradas apontam para os objetos no S3, que são apagados pela limpeza após ~24h. Faça a importação no Bluesoft logo depois de gerar o CSV — links antigos deixam de funcionar quando as fotos são removidas do bucket.
