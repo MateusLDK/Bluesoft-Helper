@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -31,6 +32,8 @@ import (
 )
 
 const version = "1.1.0"
+
+const fotosVMURL = "http://192.168.0.25:8000/processar-fotos"
 
 // ─── Payloads ────────────────────────────────────────────────────────────────
 
@@ -1489,6 +1492,64 @@ func handleAbrirLogs(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"path": dir})
 }
 
+func handleFotosUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if err := r.ParseMultipartForm(500 << 20); err != nil {
+		http.Error(w, "arquivo muito grande ou inválido", 400)
+		return
+	}
+	arquivo, header, err := r.FormFile("arquivo")
+	if err != nil {
+		http.Error(w, "arquivo não recebido", 400)
+		return
+	}
+	defer arquivo.Close()
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	parte, err := mw.CreateFormFile("arquivo", header.Filename)
+	if err != nil {
+		http.Error(w, "erro interno ao preparar envio", 500)
+		return
+	}
+	if _, err = io.Copy(parte, arquivo); err != nil {
+		http.Error(w, "erro interno ao ler arquivo", 500)
+		return
+	}
+	mw.Close()
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	req, err := http.NewRequest(http.MethodPost, fotosVMURL, &buf)
+	if err != nil {
+		http.Error(w, "erro interno ao criar requisição", 500)
+		return
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "Servidor de fotos indisponível. Verifique se a VM está ligada.", 502)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+		http.Error(w, fmt.Sprintf("Erro ao processar fotos: %s", strings.TrimSpace(string(msg))), 502)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="importacao_fotos.csv"`)
+	if v := resp.Header.Get("X-Nao-Encontrados"); v != "" {
+		w.Header().Set("X-Nao-Encontrados", v)
+	}
+	io.Copy(w, resp.Body)
+}
+
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(htmlUI))
@@ -1651,6 +1712,7 @@ func main() {
 	http.HandleFunc("/api/retry", handleRetry)
 	http.HandleFunc("/api/cancel", handleCancel)
 	http.HandleFunc("/api/abrir-logs", handleAbrirLogs)
+	http.HandleFunc("/fotos/upload", handleFotosUpload)
 	go func() {
 		time.Sleep(300 * time.Millisecond)
 		abrirNavegador(addr)

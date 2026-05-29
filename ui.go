@@ -328,6 +328,28 @@ var htmlUI = `<!DOCTYPE html>
     color: var(--text-faint); font-size: 12px;
   }
   .idle-links .sep { color: var(--text-faint); }
+  .idle-radio-group {
+    display: flex; gap: 10px; width: 100%; max-width: 560px;
+  }
+  .idle-radio {
+    flex: 1;
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 14px 16px;
+    border: 1.5px solid var(--border);
+    border-radius: var(--r-xl);
+    background: var(--bg-2);
+    cursor: pointer;
+    transition: all .15s ease;
+  }
+  .idle-radio input[type=radio] { display: none; }
+  .idle-radio-title { font-size: 13px; font-weight: 600; color: var(--text-dim); }
+  .idle-radio-sub { font-size: 11px; color: var(--text-faint); line-height: 1.5; }
+  .idle-radio.active {
+    border-color: var(--accent);
+    background: var(--accent-bg);
+  }
+  .idle-radio.active .idle-radio-title { color: var(--accent); }
+  .idle-radio:not(.active):hover { border-color: var(--border-strong); }
 
   /* ─────────────────────────────────────────────────────────
      2. Ready
@@ -824,11 +846,22 @@ var htmlUI = `<!DOCTYPE html>
   <section class="screen" data-screen="idle">
     <div class="idle-wrap">
       <div class="idle-title">
-        <h1>Importar planilha</h1>
-        <p>Solte o arquivo <code>.xlsx</code> abaixo. Você escolhe quais operações executar no próximo passo.</p>
+        <h1>O que você quer fazer?</h1>
+      </div>
+      <div class="idle-radio-group">
+        <label class="idle-radio active" id="radioLabelDados">
+          <input type="radio" name="idleModo" value="dados" checked onchange="onModoChange('dados')">
+          <span class="idle-radio-title">Atualizar dados no sistema</span>
+          <span class="idle-radio-sub">linha de compra · sortimento · NCM · pré-transferência</span>
+        </label>
+        <label class="idle-radio" id="radioLabelFotos">
+          <input type="radio" name="idleModo" value="fotos" onchange="onModoChange('fotos')">
+          <span class="idle-radio-title">Importar fotos de produtos</span>
+          <span class="idle-radio-sub">envie um .zip ou .rar e receba o CSV de resultado</span>
+        </label>
       </div>
       <div class="dropzone" id="dropzone">
-        <input type="file" id="fileInput" accept=".xlsx" onchange="onFile(this.files[0])">
+        <input type="file" id="fileInput" accept=".xlsx" onchange="onFileChange(this.files[0])" onclick="this.value=''">
         <div class="drop-icon">
           <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -836,9 +869,10 @@ var htmlUI = `<!DOCTYPE html>
             <line x1="12" y1="3" x2="12" y2="15"/>
           </svg>
         </div>
-        <div class="drop-title">Arraste o .xlsx ou clique para selecionar</div>
-        <div class="drop-hint">aba "Preencher" · cabeçalhos na linha 8</div>
+        <div class="drop-title" id="dropTitle">Arraste o .xlsx ou clique para selecionar</div>
+        <div class="drop-hint" id="dropHint">aba "Preencher" · cabeçalhos na linha 8</div>
       </div>
+      <div id="fotosStatusIdle" style="font-size:13px;text-align:center;min-height:20px;display:none"></div>
       <div class="idle-links">
         <button class="btn-link" onclick="abrirLogs()">📁 abrir pasta de logs</button>
         <span class="sep">·</span>
@@ -1024,6 +1058,7 @@ var htmlUI = `<!DOCTYPE html>
 
     </div>
   </section>
+
 
 </main>
 
@@ -1227,13 +1262,42 @@ async function setupSave() {
 // ───────────────────────────────────────────────────────────
 // Idle
 // ───────────────────────────────────────────────────────────
+const modoConfig = {
+  dados: {
+    accept: '.xlsx',
+    title: 'Arraste o .xlsx ou clique para selecionar',
+    hint: 'aba "Preencher" · cabeçalhos na linha 8',
+  },
+  fotos: {
+    accept: '.zip,.rar',
+    title: 'Arraste o .zip/.rar ou clique para selecionar',
+    hint: 'arquivo com as fotos dos produtos',
+  },
+}
+
+function onModoChange(modo) {
+  state.idleModo = modo
+  document.getElementById('radioLabelDados').classList.toggle('active', modo === 'dados')
+  document.getElementById('radioLabelFotos').classList.toggle('active', modo === 'fotos')
+  const cfg = modoConfig[modo]
+  document.getElementById('fileInput').accept = cfg.accept
+  document.getElementById('fileInput').value = ''
+  document.getElementById('dropTitle').textContent = cfg.title
+  document.getElementById('dropHint').textContent = cfg.hint
+  const s = document.getElementById('fotosStatusIdle')
+  s.style.display = 'none'
+  s.textContent = ''
+}
+
 function goToIdle() {
   state.session = null
   state.ops = { alterarNCM: false, linhaCompra: false, linhaLoja: false, linhaCompraCD: false, preTransf: false }
   state.cdTipo = 'UN'
+  state.idleModo = 'dados'
+  document.querySelector('input[name=idleModo][value=dados]').checked = true
+  onModoChange('dados')
   setScreen('idle')
   setStatus('aguardando', 'aguardando')
-  document.getElementById('fileInput').value = ''
 }
 
 // drag & drop handlers
@@ -1243,8 +1307,17 @@ dz.addEventListener('dragleave', () => dz.classList.remove('dragover'))
 dz.addEventListener('drop', e => {
   e.preventDefault(); dz.classList.remove('dragover')
   const f = e.dataTransfer.files[0]
-  if (f && f.name.toLowerCase().endsWith('.xlsx')) onFile(f)
+  if (f) onFileChange(f)
 })
+
+async function onFileChange(file) {
+  if (!file) return
+  if (state.idleModo === 'fotos') {
+    await uploadFotosInline(file)
+  } else {
+    await onFile(file)
+  }
+}
 
 async function onFile(file) {
   if (!file) return
@@ -1258,6 +1331,45 @@ async function onFile(file) {
     goToReady()
   } catch (e) {
     alert('Erro ao validar planilha: ' + e.message)
+  }
+}
+
+async function uploadFotosInline(file) {
+  const ext = file.name.split('.').pop().toLowerCase()
+  if (ext !== 'zip' && ext !== 'rar') {
+    alert('Selecione um arquivo .zip ou .rar')
+    return
+  }
+  const statusEl = document.getElementById('fotosStatusIdle')
+  statusEl.style.display = 'block'
+  statusEl.innerHTML = '<span style="color:var(--text-dim)">Enviando...</span>'
+  document.getElementById('fileInput').value = ''
+  try {
+    const fd = new FormData()
+    fd.append('arquivo', file)
+    const r = await fetch('/fotos/upload', { method: 'POST', body: fd })
+    if (!r.ok) {
+      const msg = await r.text()
+      throw new Error(msg.trim() || 'Erro desconhecido')
+    }
+    const erros = (r.headers.get('X-Nao-Encontrados') || '').split(',').filter(Boolean)
+
+    const blob = await r.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = 'importacao_fotos.csv'
+    document.body.appendChild(a); a.click(); a.remove()
+    URL.revokeObjectURL(url)
+
+    let html = '<span style="color:var(--green)">✓ CSV baixado</span>'
+    if (erros.length > 0) {
+      const nErr = erros.length
+      html += '<br><span style="color:var(--red)">✗ ' + nErr + ' não encontrada' + (nErr !== 1 ? 's' : '') + ' no banco:</span>'
+      html += '<div style="margin-top:6px;padding:8px 12px;background:var(--bg-3);border-radius:8px;font-family:var(--font-mono);font-size:11px;color:var(--text-dim);text-align:left;line-height:1.8">' + erros.map(escapeHtml).join('<br>') + '</div>'
+    }
+    statusEl.innerHTML = html
+  } catch (e) {
+    statusEl.innerHTML = '<span style="color:var(--red)">' + escapeHtml(e.message) + '</span>'
   }
 }
 
@@ -1676,7 +1788,6 @@ function resetUpload() {
   goToIdle()
 }
 
-// ───────────────────────────────────────────────────────────
 // Helpers
 // ───────────────────────────────────────────────────────────
 function escapeHtml(s) {
