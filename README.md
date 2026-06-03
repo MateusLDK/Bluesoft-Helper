@@ -101,7 +101,7 @@ Os nomes **padrão** (quando a coluna tem o mesmo nome do campo da API):
 
 ## Importação de fotos de produtos
 
-Na tela inicial, selecione **"Importar fotos de produtos"** e envie um `.zip` ou `.rar` com as imagens. Cada arquivo de imagem deve ser nomeado com o **código de referência do produto** (ex: `7891234.jpg`). Enquanto processa, um overlay **"Aguarde, processando…"** cobre a tela; ao final, o navegador baixa um CSV `importacao_fotos.csv` (`gtin;url`) com as fotos enviadas. Imagens cujo código não foi encontrado no banco são listadas na própria tela.
+Na tela inicial, selecione **"Importar fotos de produtos"** e envie um `.zip` ou `.rar` com as imagens. Cada arquivo de imagem deve ser nomeado com o **código de referência do produto** (ex: `7891234.jpg`). São aceitos os formatos `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.gif`, `.tif` e `.tiff` — **todos são convertidos para JPG antes do upload** (imagens com transparência são achatadas sobre fundo branco). Enquanto processa, um overlay **"Aguarde, processando…"** cobre a tela; ao final, o navegador baixa um CSV `importacao_fotos.csv` (`gtin;url`) com as fotos enviadas (sempre com URL terminando em `.jpg`). Imagens cujo código não foi encontrado no banco são listadas na própria tela.
 
 ### Como funciona
 
@@ -109,7 +109,7 @@ O app Go encaminha o arquivo para o serviço de fotos (`POST /processar-fotos`).
 
 1. Descompacta o `.zip`/`.rar`.
 2. **Resolve todos os GTINs numa única consulta** ao banco (JOIN entre `fornecedor_produto` e `produto_d` com `WHERE codigo_referencia = ANY(...)`), em vez de uma query por foto.
-3. **Sobe as imagens para o S3 em paralelo** (`ThreadPoolExecutor`), respeitando `S3_MAX_WORKERS`.
+3. **Converte cada imagem para JPG** (Pillow) e **sobe para o S3 em paralelo** (`ThreadPoolExecutor`), respeitando `S3_MAX_WORKERS`. Independente do formato de entrada, o objeto no S3 fica como `{codigo}.jpg` com `Content-Type: image/jpeg`.
 4. Devolve o CSV; os códigos não encontrados vão no header `X-Nao-Encontrados`.
 
 > A URL do serviço usada pelo app está em `fotosVMURL` (`main.go`). Ajuste se o serviço rodar em outro host/porta.
