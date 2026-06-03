@@ -33,6 +33,9 @@ EXTENSOES = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff")
 
 S3_MAX_WORKERS = int(os.getenv("S3_MAX_WORKERS", "10"))
 
+# tempo de validade do link presigned, em segundos (default: 7 dias, máximo da AWS)
+S3_URL_EXPIRACAO = int(os.getenv("S3_URL_EXPIRACAO", str(7 * 24 * 60 * 60)))
+
 
 def converter_para_jpg(caminho_origem, caminho_destino):
     """Converte qualquer imagem para JPG, achatando transparência sobre fundo branco."""
@@ -134,7 +137,11 @@ async def processar_fotos(arquivo: UploadFile = File(...)):
             s3.upload_file(
                 jpg_path, S3_BUCKET, key, ExtraArgs={"ContentType": "image/jpeg"}
             )
-            url = f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
+            url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": S3_BUCKET, "Key": key},
+                ExpiresIn=S3_URL_EXPIRACAO,
+            )
             return arquivo_jpg, key, gtin, url
 
         a_enviar = []
