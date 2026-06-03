@@ -9,6 +9,7 @@ import boto3
 import psycopg2
 import rarfile  # pip install rarfile
 from dotenv import load_dotenv
+from PIL import Image  # pip install pillow
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
@@ -28,9 +29,22 @@ S3_BUCKET = os.getenv("S3_BUCKET")
 S3_PREFIX = os.getenv("S3_PREFIX", "fotos-bluesoft/")
 S3_REGION = os.getenv("S3_REGION", "us-east-1")
 
-EXTENSOES = (".jpg", ".jpeg", ".png", ".webp")
+EXTENSOES = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff")
 
 S3_MAX_WORKERS = int(os.getenv("S3_MAX_WORKERS", "10"))
+
+
+def converter_para_jpg(caminho_origem, caminho_destino):
+    """Converte qualquer imagem para JPG, achatando transparência sobre fundo branco."""
+    with Image.open(caminho_origem) as img:
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGBA")
+            fundo = Image.new("RGB", img.size, (255, 255, 255))
+            fundo.paste(img, mask=img.split()[-1])
+            img = fundo
+        else:
+            img = img.convert("RGB")
+        img.save(caminho_destino, "JPEG", quality=90)
 
 
 @app.post("/processar-fotos")
@@ -109,20 +123,19 @@ async def processar_fotos(arquivo: UploadFile = File(...)):
 
         # 3) upload paralelo no S3
         def enviar(foto):
-            arquivo_foto = foto["arquivo_foto"]
             gtin = gtin_por_ref[foto["nome_sem_extensao"]]
-            key = f"{S3_PREFIX}{arquivo_foto}"
-            ct = (
-                "image/jpeg"
-                if arquivo_foto.lower().endswith((".jpg", ".jpeg"))
-                else "image/png"
+            arquivo_jpg = f"{foto['nome_sem_extensao']}.jpg"
+            jpg_path = os.path.join(
+                os.path.dirname(foto["caminho"]), f"__convertido__{arquivo_jpg}"
             )
+            converter_para_jpg(foto["caminho"], jpg_path)
+            key = f"{S3_PREFIX}{arquivo_jpg}"
             print(f"Enviando imagem do item: {gtin}")
             s3.upload_file(
-                foto["caminho"], S3_BUCKET, key, ExtraArgs={"ContentType": ct}
+                jpg_path, S3_BUCKET, key, ExtraArgs={"ContentType": "image/jpeg"}
             )
             url = f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
-            return arquivo_foto, key, gtin, url
+            return arquivo_jpg, key, gtin, url
 
         a_enviar = []
         for foto in fotos:

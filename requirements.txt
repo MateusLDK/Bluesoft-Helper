@@ -4,3 +4,4 @@ psycopg2-binary
 boto3
 rarfile
 python-dotenv
+pillow
