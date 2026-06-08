@@ -37,4 +37,10 @@ def limpar_bucket():
 
 
 if __name__ == "__main__":
-    limpar_bucket()
+    
+    ping("http://localhost:8787/ping/upload-fotos-cleanup/start")
+    try:
+        limpar_bucket()
+        ping("http://localhost:8787/ping/upload-fotos-cleanup")
+    except Exception as e:
+        ping("http://localhost:8787/ping/upload-fotos-cleanup/fail")

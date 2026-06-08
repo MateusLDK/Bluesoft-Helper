@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 import zipfile
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 from PIL import Image  # pip install pillow
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from apscheduler.schedulers.background import BackgroundScheduler
 
 load_dotenv()
 
@@ -35,6 +37,23 @@ S3_MAX_WORKERS = int(os.getenv("S3_MAX_WORKERS", "10"))
 
 # tempo de validade do link presigned, em segundos (default: 7 dias, máximo da AWS)
 S3_URL_EXPIRACAO = int(os.getenv("S3_URL_EXPIRACAO", str(7 * 24 * 60 * 60)))
+
+
+def ping():
+    url = "http://localhost:8787/ping/upload-fotos-service"
+    try:
+        r = requests.post(url, timeout=3)
+        print(f"OK [{r.status_code}] {url}")
+        print(r.text.strip())
+    except requests.exceptions.ConnectionError:
+        print("X  Nao consegui conectar — o Palantir NAO esta rodando.")
+        print(f"   Alvo: {url}")
+        print("   Suba o servidor em OUTRO terminal e deixe aberto:")
+        print("       cd ~/Documentos/python/LOTR && python3 palantir.py")
+        sys.exit(1)
+    except requests.exceptions.Timeout:
+        print(f"X  Timeout falando com {url} (servidor travado?).")
+        sys.exit(1)
 
 
 def converter_para_jpg(caminho_origem, caminho_destino):
@@ -203,5 +222,10 @@ def health():
 
 if __name__ == "__main__":
     import uvicorn
+    ping()
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(ping, "interval", minutes=60)
+    scheduler.start()
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
