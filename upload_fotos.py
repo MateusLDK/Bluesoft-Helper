@@ -229,7 +229,7 @@ def baixar_arvore(departamento: str):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT departamento, secao, grupo, subgrupo, subgrupo_produto_key
+            SELECT departamento, secao, grupo, subgrupo, sub_grupo_produto_key
             FROM categoria
             WHERE departamento = %s
             ORDER BY secao, grupo, subgrupo
