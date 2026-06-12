@@ -798,6 +798,40 @@ var htmlUI = `<!DOCTYPE html>
   .fotos-overlay-card h2 { font-size: 18px; font-weight: 600; letter-spacing: -.2px; }
   .fotos-overlay-card p  { font-size: 13px; color: var(--text-dim); line-height: 1.6; }
 
+  /* ── Modal de download da árvore mercadológica ──────── */
+  #arvoreOverlay {
+    position: fixed; inset: 0; z-index: 9998;
+    background: rgba(10,13,18,0.93);
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(4px);
+  }
+  #arvoreOverlay.hidden { display: none !important; }
+  .arvore-card {
+    background: var(--bg-2);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-2xl);
+    padding: 32px 36px;
+    max-width: 440px; width: 90%;
+    text-align: left;
+    display: flex; flex-direction: column; gap: 16px;
+    box-shadow: 0 0 60px rgba(90,200,250,0.08);
+  }
+  .arvore-card h2 { font-size: 18px; font-weight: 600; letter-spacing: -.2px; }
+  .arvore-card p  { font-size: 13px; color: var(--text-dim); line-height: 1.6; }
+  .arvore-card label { font-size: 12px; color: var(--text-dim); }
+  .arvore-card select {
+    width: 100%;
+    background: var(--bg-3);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-md);
+    padding: 9px 10px;
+    color: var(--text);
+    font-size: 13px;
+    outline: none;
+  }
+  #arvoreStatus { font-size: 13px; min-height: 18px; line-height: 1.6; }
+  .arvore-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+
   /* hidden util */
   .hidden { display: none !important; }
 </style>
@@ -903,6 +937,8 @@ var htmlUI = `<!DOCTYPE html>
       </div>
       <div id="fotosStatusIdle" style="font-size:13px;text-align:center;min-height:20px;display:none"></div>
       <div class="idle-links">
+        <button class="btn-link" onclick="abrirModalArvore()">🌳 baixar árvore mercadológica</button>
+        <span class="sep">·</span>
         <button class="btn-link" onclick="abrirLogs()">📁 abrir pasta de logs</button>
         <span class="sep">·</span>
         <button class="btn-link" onclick="goToSetup()">configurar credenciais</button>
@@ -942,6 +978,14 @@ var htmlUI = `<!DOCTYPE html>
               <div class="op-card-info">
                 <div class="op-card-name">Alterar NCM</div>
                 <div class="op-card-desc">Atualiza o NCM no cadastro do produto</div>
+              </div>
+            </div>
+
+            <div class="op-card" data-op="alterarSubgrupo" onclick="toggleOp(this)">
+              <div class="checkmark"></div>
+              <div class="op-card-info">
+                <div class="op-card-name">Alterar Subgrupo</div>
+                <div class="op-card-desc">Move o produto de subgrupo usando a coluna SUBGRUPO da planilha (margem da árvore)</div>
               </div>
             </div>
 
@@ -1100,6 +1144,23 @@ var htmlUI = `<!DOCTYPE html>
   </div>
 </div>
 
+<!-- ─── MODAL ÁRVORE MERCADOLÓGICA ─── -->
+<div id="arvoreOverlay" class="hidden">
+  <div class="arvore-card">
+    <h2>🌳 Baixar árvore mercadológica</h2>
+    <p>Selecione o departamento para baixar o CSV com a árvore atualizada (departamento · seção · grupo · subgrupo · key).</p>
+    <div>
+      <label for="arvoreDepto">Departamento</label>
+      <select id="arvoreDepto"></select>
+    </div>
+    <div id="arvoreStatus"></div>
+    <div class="arvore-actions">
+      <button class="btn btn-ghost" onclick="fecharModalArvore()">Cancelar</button>
+      <button class="btn btn-primary" id="arvoreCta" onclick="baixarArvore()">↓ Baixar CSV</button>
+    </div>
+  </div>
+</div>
+
 <div id="restartOverlay" class="hidden">
   <div class="restart-card">
     <div class="restart-icon">↑</div>
@@ -1119,7 +1180,7 @@ const state = {
   configured: false,
   tenant: '',
   session: null,            // { id, filename, size, linhas, avisos }
-  ops: { alterarNCM: false, linhaCompra: false, linhaLoja: false, linhaCompraCD: false },
+  ops: { alterarNCM: false, alterarSubgrupo: false, linhaCompra: false, linhaLoja: false, linhaCompraCD: false, preTransf: false },
   cdTipo: 'UN',
   run: null,                // { startedAt, totals, opsUsed, errors[] }
   logs: [],                 // todos eventos recebidos
@@ -1328,7 +1389,7 @@ function onModoChange(modo) {
 
 function goToIdle() {
   state.session = null
-  state.ops = { alterarNCM: false, linhaCompra: false, linhaLoja: false, linhaCompraCD: false, preTransf: false }
+  state.ops = { alterarNCM: false, alterarSubgrupo: false, linhaCompra: false, linhaLoja: false, linhaCompraCD: false, preTransf: false }
   state.cdTipo = 'UN'
   state.idleModo = 'dados'
   document.querySelector('input[name=idleModo][value=dados]').checked = true
@@ -1419,6 +1480,78 @@ function abrirLogs() {
 }
 
 // ───────────────────────────────────────────────────────────
+// Árvore mercadológica (modal de download)
+// ───────────────────────────────────────────────────────────
+// EDITAR AQUI quando a lista de departamentos mudar.
+const DEPARTAMENTOS = [
+  'BANHEIRO',
+  'BOMBONIERE',
+  'BRICOLAGEM',
+  'BRINQUEDOS',
+  'CAMEBA',
+  'COZINHA NOVA',
+  'CUIDADOS PESSOAIS',
+  'DECORACAO',
+  'ELETRO E INFORMATICA',
+  'FLORICULTURA',
+  'LAZER',
+  'LIMPEZA NOVA',
+  'MODA E ACESSORIOS',
+  'NATAL',
+  'ORGANIZACAO',
+  'PAPELARIA',
+  'PET CARE',
+  'POTE',
+  'UTILIDADES NOVA'
+]
+
+let arvoreSelectPopulado = false
+
+function abrirModalArvore() {
+  const sel = document.getElementById('arvoreDepto')
+  if (!arvoreSelectPopulado) {
+    sel.innerHTML = DEPARTAMENTOS.map(d => '<option value="' + escapeHtml(d) + '">' + escapeHtml(d) + '</option>').join('')
+    arvoreSelectPopulado = true
+  }
+  document.getElementById('arvoreStatus').innerHTML = ''
+  document.getElementById('arvoreOverlay').classList.remove('hidden')
+}
+
+function fecharModalArvore() {
+  document.getElementById('arvoreOverlay').classList.add('hidden')
+}
+
+async function baixarArvore() {
+  const sel = document.getElementById('arvoreDepto')
+  const dep = sel.value
+  const cta = document.getElementById('arvoreCta')
+  const statusEl = document.getElementById('arvoreStatus')
+  if (!dep) { statusEl.innerHTML = '<span style="color:var(--red)">selecione um departamento</span>'; return }
+  cta.disabled = true
+  cta.textContent = 'baixando…'
+  statusEl.innerHTML = ''
+  try {
+    const r = await fetch('/arvore/baixar?departamento=' + encodeURIComponent(dep))
+    if (!r.ok) {
+      const msg = await r.text()
+      throw new Error(msg.trim() || 'Erro desconhecido')
+    }
+    const blob = await r.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = 'arvore_mercadologica.csv'
+    document.body.appendChild(a); a.click(); a.remove()
+    URL.revokeObjectURL(url)
+    statusEl.innerHTML = '<span style="color:var(--green)">✓ CSV baixado</span>'
+  } catch (e) {
+    statusEl.innerHTML = '<span style="color:var(--red)">' + escapeHtml(e.message) + '</span>'
+  } finally {
+    cta.disabled = false
+    cta.textContent = '↓ Baixar CSV'
+  }
+}
+
+// ───────────────────────────────────────────────────────────
 // Ready
 // ───────────────────────────────────────────────────────────
 function goToReady() {
@@ -1456,7 +1589,7 @@ function goToReady() {
   document.getElementById('cdTipoExtra').classList.add('hidden')
   document.getElementById('preOrigemExtra').classList.add('hidden')
   document.getElementById('preOrigemInput').value = ''
-  state.ops = { alterarNCM: false, linhaCompra: false, linhaLoja: false, linhaCompraCD: false, preTransf: false }
+  state.ops = { alterarNCM: false, alterarSubgrupo: false, linhaCompra: false, linhaLoja: false, linhaCompraCD: false, preTransf: false }
 
   // No modelo PT, só Pré-transferência é permitida; outros cards ficam desabilitados.
   if (s.formato === 'pt') {
@@ -1496,7 +1629,7 @@ function toggleOp(card) {
   // Mutex: Pré-transferência roda sozinha.
   if (state.ops[op]) {
     if (op === 'preTransf') {
-      ['alterarNCM','linhaCompra','linhaLoja','linhaCompraCD'].forEach(o => {
+      ['alterarNCM','alterarSubgrupo','linhaCompra','linhaLoja','linhaCompraCD'].forEach(o => {
         if (state.ops[o]) {
           state.ops[o] = false
           const c = document.querySelector('.op-card[data-op="'+o+'"]')
@@ -1530,6 +1663,7 @@ function onCdTipo(input) {
 function refreshReadyCta() {
   const opsList = []
   if (state.ops.alterarNCM) opsList.push('Alterar NCM')
+  if (state.ops.alterarSubgrupo) opsList.push('Alterar Subgrupo')
   if (state.ops.linhaCompra) opsList.push('Linha de Compra')
   if (state.ops.linhaLoja) opsList.push('Sortimento')
   if (state.ops.linhaCompraCD) opsList.push('Linha CD (' + state.cdTipo + ')')
@@ -1595,6 +1729,7 @@ async function rodar({ retry, linhas }) {
 
   const opsLabel = []
   if (state.ops.alterarNCM) opsLabel.push('NCM')
+  if (state.ops.alterarSubgrupo) opsLabel.push('Subgrupo')
   if (state.ops.linhaCompra) opsLabel.push('Compra')
   if (state.ops.linhaLoja) opsLabel.push('Sortimento')
   if (state.ops.linhaCompraCD) opsLabel.push('CD(' + state.cdTipo + ')')
@@ -1618,6 +1753,7 @@ async function rodar({ retry, linhas }) {
   const body = {
     id: state.session.id,
     alterarNCM: state.ops.alterarNCM,
+    alterarSubgrupo: state.ops.alterarSubgrupo,
     linhaCompra: state.ops.linhaCompra,
     linhaCompraCD: state.ops.linhaCompraCD,
     linhaLoja: state.ops.linhaLoja,

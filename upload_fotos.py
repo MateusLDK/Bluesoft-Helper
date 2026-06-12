@@ -1,4 +1,5 @@
 import csv
+import io
 import os
 import shutil
 import tempfile
@@ -11,7 +12,7 @@ import rarfile  # pip install rarfile
 from dotenv import load_dotenv
 from PIL import Image  # pip install pillow
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 load_dotenv()
 
@@ -194,6 +195,60 @@ async def processar_fotos(arquivo: UploadFile = File(...)):
     # cleanup acontece depois do FileResponse ser enviado
     # pra garantir, usa um endpoint de health pra confirmar que tá vivo
     # e considera um background task pra limpar o tmp_dir
+
+
+@app.get("/arvore")
+def baixar_arvore(departamento: str):
+    departamento = (departamento or "").strip()
+    if not departamento:
+        raise HTTPException(status_code=400, detail="Informe o departamento")
+
+    conn = None
+    cur = None
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT departamento, secao, grupo, subgrupo, subgrupo_produto_key
+            FROM categoria
+            WHERE departamento = %s
+            ORDER BY secao, grupo, subgrupo
+            """,
+            (departamento,),
+        )
+        linhas = cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+    if not linhas:
+        raise HTTPException(
+            status_code=404, detail=f"Departamento '{departamento}' não encontrado"
+        )
+
+    buf = io.StringIO()
+    buf.write("﻿")  # BOM para acentos abrirem certo no Excel
+    writer = csv.writer(buf, delimiter=";")
+    writer.writerow(
+        ["departamento", "secao", "grupo", "subgrupo", "subgrupo_produto_key"]
+    )
+    for linha in linhas:
+        writer.writerow(linha)
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="arvore_mercadologica.csv"'
+        },
+    )
 
 
 @app.get("/health")

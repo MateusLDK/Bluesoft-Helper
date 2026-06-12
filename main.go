@@ -31,9 +31,10 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
-const version = "1.3.0"
+const version = "1.4.0"
 
 const fotosVMURL = "http://192.168.0.25:8000/processar-fotos"
+const arvoreVMURL = "http://192.168.0.25:8000/arvore"
 
 // ─── Payloads ────────────────────────────────────────────────────────────────
 
@@ -72,6 +73,12 @@ type PayloadLinhaLoja struct {
 
 type PayloadNCM struct {
 	NCM string `json:"ncm"`
+}
+
+type PayloadSubgrupo struct {
+	SubGrupoProduto int     `json:"subGrupoProduto"`
+	ValorMargem     float64 `json:"valorMargem"`
+	QuebraMargem    float64 `json:"quebraMargem"`
 }
 
 type ItemPreTransferencia struct {
@@ -397,6 +404,56 @@ func consultarGTINv(tenant, token, gtin string) (*ProdutoInfo, int, string, erro
 	}, status, body, nil
 }
 
+// ─── Consulta de margem por subgrupo (árvore mercadológica) ──────────────────
+
+type MargemSubgrupo struct {
+	ValorMargem  float64
+	QuebraMargem float64
+	TemMargem    bool // false quando o subgrupo existe mas não tem margensPossiveis
+	Existe       bool // false quando o subgrupo não foi encontrado na árvore
+}
+
+type arvoreItem struct {
+	SubGrupoProdutoKey int    `json:"subGrupoProdutoKey"`
+	Tipo               string `json:"tipo"`
+	MargensPossiveis   []struct {
+		ValorMargem  float64 `json:"valorMargem"`
+		QuebraMargem float64 `json:"quebraMargem"`
+	} `json:"margensPossiveis"`
+}
+
+// consultarMargemSubgrupo busca o subgrupo na árvore mercadológica e devolve a
+// primeira margem possível. Confere o subGrupoProdutoKey client-side em vez de
+// confiar cegamente no filtro server-side.
+func consultarMargemSubgrupo(tenant, token string, key int, rl *runLog) (MargemSubgrupo, error) {
+	ep := fmt.Sprintf("https://erp.bluesoft.com.br/%s/api/comercial/arvoremercadologica?tipo=SUBGRUPO&categoriaKey=%d", tenant, key)
+	status, raw, err := getAPI(token, ep)
+	rl.httpCall(fmt.Sprintf("Subgrupo lookup (key %d)", key), "GET", ep, nil, status, string(raw), err)
+	if err != nil {
+		return MargemSubgrupo{}, err
+	}
+	if status != 200 {
+		return MargemSubgrupo{}, fmt.Errorf("árvore mercadológica: HTTP %d", status)
+	}
+	var itens []arvoreItem
+	if err := json.Unmarshal(raw, &itens); err != nil {
+		return MargemSubgrupo{}, fmt.Errorf("resposta inválida da árvore mercadológica")
+	}
+	for _, it := range itens {
+		if it.Tipo != "SUBGRUPO" || it.SubGrupoProdutoKey != key {
+			continue
+		}
+		m := MargemSubgrupo{Existe: true}
+		if len(it.MargensPossiveis) > 0 {
+			m.ValorMargem = it.MargensPossiveis[0].ValorMargem
+			m.QuebraMargem = it.MargensPossiveis[0].QuebraMargem
+			m.TemMargem = true
+		}
+		return m, nil
+	}
+	return MargemSubgrupo{Existe: false}, nil
+}
+
 // ─── Leitura da planilha TOYNG ────────────────────────────────────────────────
 
 type ProdutoLinha struct {
@@ -409,6 +466,7 @@ type ProdutoLinha struct {
 	LojaOrigem    int         // só preenchido no modelo PT
 	CodigoPT      int         // produtoKey direto, quando vem da coluna "codigo" do modelo PT
 	GTINPT        int         // gtin direto, quando vem da coluna "barra" do modelo PT
+	Subgrupo      int         // subGrupoProdutoKey da coluna "SUBGRUPO" — 0 = ausente
 }
 
 // excluida = lojas que nunca recebem parâmetro (sempre filtradas).
@@ -476,7 +534,7 @@ func lerPlanilha(caminho string) ([]ProdutoLinha, []string, string, error) {
 func lerPlanilhaFicha(rows [][]string) ([]ProdutoLinha, []string, error) {
 	header := rows[7]
 
-	eanCol, dunCol, ncmCol := -1, -1, -1
+	eanCol, dunCol, ncmCol, subgrupoCol := -1, -1, -1, -1
 	type lojaCol struct {
 		idx  int
 		loja int
@@ -490,6 +548,8 @@ func lerPlanilhaFicha(rows [][]string) ([]ProdutoLinha, []string, error) {
 			eanCol = i
 		} else if dunCol == -1 && strings.Contains(hUp, "DUN 14") {
 			dunCol = i
+		} else if subgrupoCol == -1 && strings.Contains(hUp, "SUBGRUPO") {
+			subgrupoCol = i
 		} else if ncmCol == -1 && strings.Contains(hUp, "NCM") {
 			ncmCol = i
 		}
@@ -514,8 +574,10 @@ func lerPlanilhaFicha(rows [][]string) ([]ProdutoLinha, []string, error) {
 
 	var result []ProdutoLinha
 	contadores := struct {
-		semNCM     int
-		expandidas int
+		semNCM           int
+		expandidas       int
+		semSubgrupo      int
+		subgrupoInvalido int
 	}{}
 	for rowIdx, row := range rows[8:] {
 		linhaPlanilha := rowIdx + 9
@@ -539,6 +601,20 @@ func lerPlanilhaFicha(rows [][]string) ([]ProdutoLinha, []string, error) {
 		}
 		if ncm == "" {
 			contadores.semNCM++
+		}
+		subgrupo := 0
+		if subgrupoCol >= 0 {
+			raw := ""
+			if subgrupoCol < len(row) {
+				raw = strings.TrimSpace(row[subgrupoCol])
+			}
+			if raw == "" {
+				contadores.semSubgrupo++
+			} else if v, err := strconv.Atoi(raw); err == nil {
+				subgrupo = v
+			} else {
+				contadores.subgrupoInvalido++
+			}
 		}
 
 		// Lê quantidades + lista de lojas (>0).
@@ -587,6 +663,7 @@ func lerPlanilhaFicha(rows [][]string) ([]ProdutoLinha, []string, error) {
 			NCM:           ncm,
 			Lojas:         lojas,
 			Quantidades:   quantidades,
+			Subgrupo:      subgrupo,
 		})
 	}
 
@@ -596,6 +673,12 @@ func lerPlanilhaFicha(rows [][]string) ([]ProdutoLinha, []string, error) {
 	}
 	if contadores.expandidas > 0 {
 		avisos = append(avisos, fmt.Sprintf("%d linhas sem lojas — expandidas para todas", contadores.expandidas))
+	}
+	if subgrupoCol >= 0 && contadores.semSubgrupo > 0 {
+		avisos = append(avisos, fmt.Sprintf("%d linhas sem SUBGRUPO", contadores.semSubgrupo))
+	}
+	if contadores.subgrupoInvalido > 0 {
+		avisos = append(avisos, fmt.Sprintf("%d linhas com SUBGRUPO não numérico — serão puladas", contadores.subgrupoInvalido))
 	}
 	return result, avisos, nil
 }
@@ -762,7 +845,8 @@ const divisaoKey = 1
 func processarProduto(
 	tenant, token string,
 	produto ProdutoLinha,
-	fazerLinhaCompra, fazerLinhaCompraCD, fazerLinhaLoja, fazerNCM bool,
+	fazerLinhaCompra, fazerLinhaCompraCD, fazerLinhaLoja, fazerNCM, fazerSubgrupo bool,
+	margens map[int]MargemSubgrupo,
 	cdTipo string,
 	rl *runLog,
 	emit func(EventoSSE),
@@ -795,7 +879,7 @@ func processarProduto(
 	// Linha de Compra e Sortimento sempre usam EAN 13.
 	// Linha CD em UN também usa EAN 13; em CX usa o DUN 14 (lookup separado).
 	// Alterar NCM também usa EAN 13.
-	precisaUN := fazerLinhaCompra || fazerLinhaLoja || fazerNCM || (fazerLinhaCompraCD && cdTipo != "CX")
+	precisaUN := fazerLinhaCompra || fazerLinhaLoja || fazerNCM || fazerSubgrupo || (fazerLinhaCompraCD && cdTipo != "CX")
 	precisaCX := fazerLinhaCompraCD && cdTipo == "CX"
 
 	var infoUN *ProdutoInfo
@@ -828,6 +912,32 @@ func processarProduto(
 				send("erro", op, fmt.Sprintf("EAN %s — %s", produto.EAN, apiErrMsg(status, body, err)))
 			} else {
 				send("ok", op, fmt.Sprintf("EAN %s → NCM %s", produto.EAN, produto.NCM))
+			}
+		}
+	}
+
+	// ── 0b. Alterar Subgrupo ──
+	if fazerSubgrupo && infoUN != nil {
+		op := "Subgrupo"
+		if produto.Subgrupo == 0 {
+			send("aviso", op, fmt.Sprintf("EAN %s: SUBGRUPO ausente na planilha, pulando", produto.EAN))
+		} else if m, ok := margens[produto.Subgrupo]; !ok || !m.Existe {
+			send("erro", op, fmt.Sprintf("EAN %s: subgrupo %d não existe na árvore mercadológica", produto.EAN, produto.Subgrupo))
+		} else if !m.TemMargem {
+			send("erro", op, fmt.Sprintf("EAN %s: subgrupo %d sem margens cadastradas", produto.EAN, produto.Subgrupo))
+		} else {
+			ep := fmt.Sprintf("https://erp.bluesoft.com.br/%s/api/comercial/produtos/%d", tenant, infoUN.ProdutoKey)
+			payload := PayloadSubgrupo{
+				SubGrupoProduto: produto.Subgrupo,
+				ValorMargem:     m.ValorMargem,
+				QuebraMargem:    m.QuebraMargem,
+			}
+			status, body, err := putAPI(token, ep, payload)
+			rl.httpCall(fmt.Sprintf("Subgrupo | EAN %s (produto %d)", produto.EAN, infoUN.ProdutoKey), "PUT", ep, payload, status, body, err)
+			if err != nil || (status != 200 && status != 201 && status != 204) {
+				send("erro", op, fmt.Sprintf("EAN %s — %s", produto.EAN, apiErrMsg(status, body, err)))
+			} else {
+				send("ok", op, fmt.Sprintf("EAN %s → subgrupo %d (margem %.2f)", produto.EAN, produto.Subgrupo, m.ValorMargem))
 			}
 		}
 	}
@@ -1224,6 +1334,7 @@ type runOpcoes struct {
 	LinhaCompraCD    bool   `json:"linhaCompraCD"`
 	LinhaLoja        bool   `json:"linhaLoja"`
 	AlterarNCM       bool   `json:"alterarNCM"`
+	AlterarSubgrupo  bool   `json:"alterarSubgrupo"`
 	PreTransferencia bool   `json:"preTransferencia"`
 	CdTipo           string `json:"cdTipo"`
 	LojaOrigem       int    `json:"lojaOrigem"`       // só usado quando formato=ficha + PT
@@ -1251,12 +1362,12 @@ func executaSSE(w http.ResponseWriter, r *http.Request, isRetry bool) {
 	if req.CdTipo == "" {
 		req.CdTipo = "UN"
 	}
-	if !req.LinhaCompra && !req.LinhaCompraCD && !req.LinhaLoja && !req.AlterarNCM && !req.PreTransferencia {
+	if !req.LinhaCompra && !req.LinhaCompraCD && !req.LinhaLoja && !req.AlterarNCM && !req.AlterarSubgrupo && !req.PreTransferencia {
 		http.Error(w, "selecione ao menos uma operação", 400)
 		return
 	}
 	// Pré-transferência é exclusiva (não combina com as outras ops no mesmo run).
-	if req.PreTransferencia && (req.LinhaCompra || req.LinhaCompraCD || req.LinhaLoja || req.AlterarNCM) {
+	if req.PreTransferencia && (req.LinhaCompra || req.LinhaCompraCD || req.LinhaLoja || req.AlterarNCM || req.AlterarSubgrupo) {
 		http.Error(w, "Pré-transferência roda sozinha — desmarque as outras operações", 400)
 		return
 	}
@@ -1349,6 +1460,9 @@ func executaSSE(w http.ResponseWriter, r *http.Request, isRetry bool) {
 	if req.AlterarNCM {
 		ops = append(ops, "Alterar NCM")
 	}
+	if req.AlterarSubgrupo {
+		ops = append(ops, "Alterar Subgrupo")
+	}
 	if req.LinhaCompra {
 		ops = append(ops, "Linha Compra")
 	}
@@ -1388,6 +1502,30 @@ func executaSSE(w http.ResponseWriter, r *http.Request, isRetry bool) {
 		flusher.Flush()
 		sendMu.Unlock()
 	} else {
+		// Alterar Subgrupo: consulta a árvore uma vez por subgrupo key distinta
+		// presente na planilha e cacheia o resultado para o run inteiro.
+		margens := map[int]MargemSubgrupo{}
+		if req.AlterarSubgrupo {
+			emitInfo("🌳 Consultando subgrupos na árvore mercadológica…")
+			for _, p := range produtos {
+				if p.Subgrupo == 0 {
+					continue
+				}
+				if _, ok := margens[p.Subgrupo]; ok {
+					continue
+				}
+				m, err := consultarMargemSubgrupo(tenant, token, p.Subgrupo, rl)
+				if err != nil {
+					// Falha de consulta vira "não existe" no mapa — erro por linha no loop.
+					emit(EventoSSE{Tipo: "aviso", Op: "Subgrupo", Mensagem: fmt.Sprintf("subgrupo %d: %v", p.Subgrupo, err)})
+					margens[p.Subgrupo] = MargemSubgrupo{Existe: false}
+					continue
+				}
+				margens[p.Subgrupo] = m
+			}
+			emitInfo(fmt.Sprintf("%d subgrupos consultados", len(margens)))
+		}
+
 		cancelado := false
 		// Linha de Compra deve estar 100% concluída antes de CD e Loja (o sistema
 		// só aceita sortimento/CD após o produto já ter linha de compra em todas as lojas).
@@ -1411,8 +1549,8 @@ func executaSSE(w http.ResponseWriter, r *http.Request, isRetry bool) {
 				break
 			}
 			processarProduto(tenant, token, p,
-				req.LinhaCompra, passOneCD, passOneLoja, req.AlterarNCM,
-				req.CdTipo, rl, emitContando,
+				req.LinhaCompra, passOneCD, passOneLoja, req.AlterarNCM, req.AlterarSubgrupo,
+				margens, req.CdTipo, rl, emitContando,
 			)
 			sendMu.Lock()
 			prog := map[string]any{"atual": i + 1, "total": totalSteps}
@@ -1435,8 +1573,8 @@ func executaSSE(w http.ResponseWriter, r *http.Request, isRetry bool) {
 					break
 				}
 				processarProduto(tenant, token, p,
-					false, req.LinhaCompraCD, req.LinhaLoja, false,
-					req.CdTipo, rl, emitContando,
+					false, req.LinhaCompraCD, req.LinhaLoja, false, false,
+					nil, req.CdTipo, rl, emitContando,
 				)
 				sendMu.Lock()
 				prog := map[string]any{"atual": len(produtos) + i + 1, "total": totalSteps}
@@ -1547,6 +1685,51 @@ func handleFotosUpload(w http.ResponseWriter, r *http.Request) {
 	if v := resp.Header.Get("X-Nao-Encontrados"); v != "" {
 		w.Header().Set("X-Nao-Encontrados", v)
 	}
+	io.Copy(w, resp.Body)
+}
+
+func handleArvoreBaixar(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	dep := strings.TrimSpace(r.URL.Query().Get("departamento"))
+	if dep == "" {
+		http.Error(w, "informe o departamento", 400)
+		return
+	}
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	ep := arvoreVMURL + "?departamento=" + url.QueryEscape(dep)
+	req, err := http.NewRequest(http.MethodGet, ep, nil)
+	if err != nil {
+		http.Error(w, "erro interno ao criar requisição", 500)
+		return
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "Servidor da árvore indisponível. Verifique se a VM está ligada.", 502)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		msg := strings.TrimSpace(string(body))
+		// O FastAPI devolve {"detail": "..."} — extrai a mensagem limpa quando possível.
+		var errResp struct {
+			Detail string `json:"detail"`
+		}
+		if json.Unmarshal(body, &errResp) == nil && errResp.Detail != "" {
+			msg = errResp.Detail
+		}
+		http.Error(w, msg, 502)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="arvore_mercadologica.csv"`)
 	io.Copy(w, resp.Body)
 }
 
@@ -1719,6 +1902,7 @@ func main() {
 	http.HandleFunc("/api/cancel", handleCancel)
 	http.HandleFunc("/api/abrir-logs", handleAbrirLogs)
 	http.HandleFunc("/fotos/upload", handleFotosUpload)
+	http.HandleFunc("/arvore/baixar", handleArvoreBaixar)
 	go func() {
 		time.Sleep(300 * time.Millisecond)
 		abrirNavegador(addr)
