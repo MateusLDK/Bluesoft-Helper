@@ -1,4 +1,5 @@
 import os
+import requests
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -10,6 +11,21 @@ S3_BUCKET = os.getenv("S3_BUCKET")
 S3_PREFIX = os.getenv("S3_PREFIX", "fotos-bluesoft/")
 S3_REGION = os.getenv("S3_REGION", "us-east-1")
 IDADE_HORAS = 24  # apaga objetos mais velhos que isso
+
+def ping(url:str):
+    try:
+        r = requests.post(url, timeout=3)
+        print(f"OK [{r.status_code}] {url}")
+        print(r.text.strip())
+    except requests.exceptions.ConnectionError:
+        print("X  Nao consegui conectar — o Palantir NAO esta rodando.")
+        print(f"   Alvo: {url}")
+        print("   Suba o servidor em OUTRO terminal e deixe aberto:")
+        print("       cd ~/Documentos/python/LOTR && python3 palantir.py")
+        sys.exit(1)
+    except requests.exceptions.Timeout:
+        print(f"X  Timeout falando com {url} (servidor travado?).")
+        sys.exit(1)
 
 
 def limpar_bucket():
@@ -37,4 +53,10 @@ def limpar_bucket():
 
 
 if __name__ == "__main__":
-    limpar_bucket()
+    
+    ping("http://localhost:8787/ping/upload-fotos-cleanup/start")
+    try:
+        limpar_bucket()
+        ping("http://localhost:8787/ping/upload-fotos-cleanup")
+    except Exception as e:
+        ping("http://localhost:8787/ping/upload-fotos-cleanup/fail")
