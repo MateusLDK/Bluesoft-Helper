@@ -1734,8 +1734,18 @@ func handleArvoreBaixar(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(htmlUI))
+	page, err := webFS.ReadFile("web/index.html")
+	if err != nil {
+		http.Error(w, "index.html não encontrado", http.StatusInternalServerError)
+		return
+	}
+	w.Write(page)
 }
 
 func abrirNavegador(u string) {
@@ -1892,6 +1902,7 @@ func main() {
 	port := ln.Addr().(*net.TCPAddr).Port
 	addr := fmt.Sprintf("http://127.0.0.1:%d", port)
 	http.HandleFunc("/", handleIndex)
+	http.Handle("/static/", http.StripPrefix("/static/", noCache(http.FileServerFS(staticFS))))
 	http.HandleFunc("/api/setup", handleSetup)
 	http.HandleFunc("/api/setup/test", handleSetupTest)
 	http.HandleFunc("/api/setup/save", handleSetupSave)

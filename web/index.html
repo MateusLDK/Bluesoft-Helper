@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>Bluesoft Uploader</title>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('tema')==='light'?'light':'dark'}catch(e){}</script>
+<link rel="stylesheet" href="/static/fonts.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div class="logo">↑</div>
+    <div>
+      <span class="name">Bluesoft Uploader</span>
+      <span class="sub">via .xlsx</span>
+    </div>
+  </div>
+  <div class="header-right">
+    <button id="themeToggle" class="theme-toggle" data-action="toggleTheme" title="Alternar tema" aria-label="Alternar tema claro ou escuro">🌙</button>
+    <span id="tenantPill" class="pill tenant hidden" data-action="goToSetup">
+      <span class="pill-label">tenant</span>
+      <span class="pill-value" id="tenantValue">—</span>
+      <span class="caret">▾</span>
+    </span>
+    <span id="statusPill" class="pill status aguardando" role="status" aria-live="polite">
+      <span class="status-label">aguardando</span>
+    </span>
+  </div>
+</header>
+
+<main>
+
+  <!-- ─── SETUP ─── -->
+  <section class="screen" data-screen="setup">
+    <div class="setup-wrap">
+      <span class="badge"><span class="badge-dot"></span> Configuração inicial</span>
+      <div class="setup-title">
+        <h1>Conectar ao Bluesoft ERP</h1>
+        <p>Informe as credenciais da API uma vez. Elas ficam salvas em <code>.env</code> na pasta do executável e são reusadas nas próximas execuções.</p>
+      </div>
+      <div class="card setup-form">
+        <div class="field">
+          <div class="field-row">
+            <label class="field-label" for="setupTenant">Tenant</label>
+            <span class="field-hint">o subdomínio do cliente no Bluesoft (ex: minipreco)</span>
+          </div>
+          <input type="text" id="setupTenant" class="input" placeholder="minipreco">
+          <div class="field-err" id="err-setupTenant"></div>
+        </div>
+        <div class="field">
+          <div class="field-row">
+            <label class="field-label" for="setupClientId">Client ID</label>
+            <span class="field-hint">fornecido pela equipe Bluesoft</span>
+          </div>
+          <input type="text" id="setupClientId" class="input" placeholder="79648963c7fe9d13e454aae876b6…">
+          <div class="field-err" id="err-setupClientId"></div>
+        </div>
+        <div class="field">
+          <div class="field-row">
+            <label class="field-label" for="setupSecret">Client Secret</label>
+            <span class="field-hint">mantenha em segredo — armazenado localmente em .env</span>
+          </div>
+          <div class="input-group">
+            <input type="password" id="setupSecret" class="input" placeholder="••••••••••••••••••••••••">
+            <button class="toggle" data-action="toggleSecret">mostrar</button>
+          </div>
+          <div class="field-err" id="err-setupSecret"></div>
+        </div>
+        <div class="setup-feedback" id="setupFeedback"></div>
+        <div class="setup-actions">
+          <button class="btn-link" data-action="abrirErp">⓵ onde encontro essas credenciais?</button>
+          <div class="row-inline">
+            <button class="btn btn-ghost hidden" id="setupCancel" data-action="cancelSetup">Cancelar</button>
+            <button class="btn btn-primary" id="setupCta" disabled data-action="setupCtaClick">Testar conexão</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── IDLE ─── -->
+  <section class="screen" data-screen="idle">
+    <div class="idle-wrap">
+      <div class="idle-title">
+        <h1>O que você quer fazer?</h1>
+      </div>
+      <div class="idle-radio-group">
+        <label class="idle-radio active" id="radioLabelDados">
+          <input type="radio" name="idleModo" value="dados" checked>
+          <span class="idle-radio-title">Atualizar dados no sistema</span>
+          <span class="idle-radio-sub">linha de compra · sortimento · NCM · pré-transferência</span>
+        </label>
+        <label class="idle-radio" id="radioLabelFotos">
+          <input type="radio" name="idleModo" value="fotos">
+          <span class="idle-radio-title">Importar fotos de produtos</span>
+          <span class="idle-radio-sub">envie um .zip ou .rar e receba o CSV de resultado</span>
+        </label>
+      </div>
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="fileInput" accept=".xlsx">
+        <div class="drop-icon">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+        </div>
+        <div class="drop-title" id="dropTitle">Arraste o .xlsx ou clique para selecionar</div>
+        <div class="drop-hint" id="dropHint">aba "Preencher" · cabeçalhos na linha 8</div>
+        <div class="drop-busy">
+          <div class="spinner-sm"></div>
+          <div class="drop-busy-text">Validando planilha…</div>
+        </div>
+      </div>
+      <div id="fotosStatusIdle" class="inline-status" style="display:none"></div>
+      <div class="idle-links">
+        <button class="btn-link" data-action="abrirModalArvore">🌳 baixar árvore mercadológica</button>
+        <span class="sep">·</span>
+        <button class="btn-link" data-action="abrirLogs">📁 abrir pasta de logs</button>
+        <span class="sep">·</span>
+        <button class="btn-link" data-action="goToSetup">configurar credenciais</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── READY ─── -->
+  <section class="screen" data-screen="ready">
+    <div class="ready-grid">
+      <div class="ready-section">
+        <div>
+          <div class="ready-label">Arquivo</div>
+          <div class="card file-card">
+            <div class="ext">XLSX</div>
+            <div class="file-info">
+              <div class="file-name" id="readyFilename">—</div>
+              <div class="file-meta" id="readyFilemeta">— linhas · — KB</div>
+            </div>
+            <button class="file-x" data-action="resetUpload" title="Remover arquivo">×</button>
+          </div>
+        </div>
+        <div>
+          <div class="ready-label with-gap">Validação</div>
+          <div class="validation-list" id="validationList"></div>
+        </div>
+      </div>
+
+      <div class="ready-section">
+        <div>
+          <div class="ready-label">Operações</div>
+          <p class="ops-hint">Selecione o que executar nessa importação. A planilha contém os dados de todas as operações.</p>
+          <div class="ops-grid">
+
+            <div class="op-card" role="checkbox" tabindex="0" aria-checked="false" data-op="alterarNCM">
+              <div class="checkmark"></div>
+              <div class="op-card-info">
+                <div class="op-card-name">Alterar NCM</div>
+                <div class="op-card-desc">Atualiza o NCM no cadastro do produto</div>
+              </div>
+            </div>
+
+            <div class="op-card" role="checkbox" tabindex="0" aria-checked="false" data-op="alterarSubgrupo">
+              <div class="checkmark"></div>
+              <div class="op-card-info">
+                <div class="op-card-name">Alterar Subgrupo</div>
+                <div class="op-card-desc">Move o produto de subgrupo usando a coluna SUBGRUPO da planilha (margem da árvore)</div>
+              </div>
+            </div>
+
+            <div class="op-card" role="checkbox" tabindex="0" aria-checked="false" data-op="linhaCompra">
+              <div class="checkmark"></div>
+              <div class="op-card-info">
+                <div class="op-card-name">Linha de Compra</div>
+                <div class="op-card-desc">Cadastra produto nas lojas selecionadas</div>
+              </div>
+            </div>
+
+            <div class="op-card" role="checkbox" tabindex="0" aria-checked="false" data-op="linhaLoja">
+              <div class="checkmark"></div>
+              <div class="op-card-info">
+                <div class="op-card-name">Sortimento / Linha de Loja</div>
+                <div class="op-card-desc">Define parâmetros de sortimento por loja</div>
+              </div>
+            </div>
+
+            <div class="op-card" role="checkbox" tabindex="0" aria-checked="false" data-op="linhaCompraCD">
+              <div class="checkmark"></div>
+              <div class="op-card-info">
+                <div class="op-card-name">Linha de Compra CD</div>
+                <div class="op-card-desc">Agrupa lojas por centro de distribuição</div>
+                <div class="op-card-extra hidden" id="cdTipoExtra">
+                  <label class="active" id="cdTipoUNLabel">
+                    <input type="radio" name="cdTipo" value="UN" checked>
+                    UN
+                  </label>
+                  <label id="cdTipoCXLabel">
+                    <input type="radio" name="cdTipo" value="CX">
+                    CX
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <div class="op-card" role="checkbox" tabindex="0" aria-checked="false" data-op="preTransf">
+              <div class="checkmark"></div>
+              <div class="op-card-info">
+                <div class="op-card-name">Pré-transferência</div>
+                <div class="op-card-desc">Cria pré-transferência multiloja a partir das quantidades por loja</div>
+                <div class="op-card-extra hidden" id="preOrigemExtra">
+                  <label class="op-origem-label">loja origem:</label>
+                  <input type="number" id="preOrigemInput" class="op-origem-input" placeholder="ex: 5" min="1">
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+        <div class="card ready-footer">
+          <div class="summary-text">
+            <span class="t" id="readyCtaTitle">Selecione uma operação</span>
+            <span class="s" id="readyCtaSubtitle">— linhas processadas</span>
+          </div>
+          <button class="btn btn-primary" id="readyCta" disabled data-action="iniciarRun">→ Enviar para API</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── SENDING ─── -->
+  <section class="screen" data-screen="sending">
+    <div class="sending-wrap">
+      <div class="sending-top">
+        <div class="info">
+          <div class="t">Enviando para API</div>
+          <div class="s"><strong id="sendingFilename">—</strong> · operação: <strong id="sendingOp">—</strong></div>
+        </div>
+        <div class="ctrls">
+          <button class="btn btn-danger" data-action="parar" id="btnParar">■ Parar</button>
+        </div>
+      </div>
+
+      <div class="progress-wrap"><div class="progress-fill" id="progFill"></div></div>
+
+      <div class="stats-row">
+        <div class="stat processadas"><span class="label">processadas</span><span class="val" id="statProc">0/0</span></div>
+        <div class="stat success"><span class="val" id="statOk">0</span><span class="label">sucesso</span></div>
+        <div class="stat warn"><span class="val" id="statWarn">0</span><span class="label">avisos</span></div>
+        <div class="stat err"><span class="val" id="statErr">0</span><span class="label">erros</span></div>
+        <div class="stat eta" id="statEta">—</div>
+      </div>
+
+      <div class="filter-bar">
+        <button class="filter-tab active" data-filter="tudo" aria-pressed="true">Tudo <span class="count" id="cntTudo">0</span></button>
+        <button class="filter-tab" data-filter="ok" aria-pressed="false">Sucesso <span class="count" id="cntOk">0</span></button>
+        <button class="filter-tab" data-filter="aviso" aria-pressed="false">Avisos <span class="count" id="cntAviso">0</span></button>
+        <button class="filter-tab" data-filter="erro" aria-pressed="false">Erros <span class="count" id="cntErro">0</span></button>
+        <div class="right">
+          <button class="btn-link" data-action="abrirLogs">↓ exportar log</button>
+        </div>
+      </div>
+
+      <div class="log-list" id="logList" role="log" aria-live="polite" aria-relevant="additions"></div>
+    </div>
+  </section>
+
+  <!-- ─── DONE ─── -->
+  <section class="screen" data-screen="done">
+    <div class="done-wrap">
+      <div class="card done-hero">
+        <span class="badge" id="doneBadge"><span class="badge-dot green"></span> Concluído</span>
+        <h2 id="doneTitle">Importação concluída</h2>
+        <div class="meta"><strong id="doneFilename">—</strong> · <span id="doneOps">—</span> · <span id="doneDuration">—</span></div>
+        <div class="actions">
+          <button class="btn btn-ghost" data-action="abrirLogs">↗ relatório completo</button>
+          <button class="btn btn-ghost" data-action="resetUpload">↻ nova importação</button>
+        </div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-cell"><div class="val mono" id="doneTotal">0</div><div class="lbl">total</div></div>
+        <div class="stat-cell s-ok"><div class="val mono" id="doneOk">0</div><div class="lbl">sucesso</div></div>
+        <div class="stat-cell s-warn"><div class="val mono" id="doneWarn">0</div><div class="lbl">avisos</div></div>
+        <div class="stat-cell s-err"><div class="val mono" id="doneErr">0</div><div class="lbl">erros</div></div>
+      </div>
+
+      <div class="stack-bar" id="doneStack"></div>
+
+      <div class="card errors-card hidden" id="errorsCard">
+        <div class="head">
+          <span class="t">Erros</span>
+          <span class="s" id="errorsSub">0 itens</span>
+        </div>
+        <div class="body" id="errorsBody"></div>
+        <div class="footer">
+          <span class="info">Reenvia somente as linhas que falharam.</span>
+          <button class="btn btn-primary" data-action="reenviarErros">↻ Reenviar erros</button>
+        </div>
+      </div>
+
+      <div class="card pt-keys-card hidden" id="ptKeysCard">
+        <div class="head">
+          <span class="t">🔑 Chaves de Pré-transferência</span>
+        </div>
+        <div class="keys" id="ptKeysList"></div>
+      </div>
+
+    </div>
+  </section>
+
+
+</main>
+
+<!-- ─── RESTART OVERLAY ─── -->
+<div id="fotosOverlay" class="hidden">
+  <div class="fotos-overlay-card" role="alert" aria-busy="true">
+    <div class="fotos-spinner"></div>
+    <h2>Aguarde, processando…</h2>
+    <p>Enviando as fotos e consultando o banco. Isso pode levar alguns instantes — não feche o programa.</p>
+  </div>
+</div>
+
+<!-- ─── MODAL ÁRVORE MERCADOLÓGICA ─── -->
+<div id="arvoreOverlay" class="hidden">
+  <div class="arvore-card" role="dialog" aria-modal="true" aria-labelledby="arvoreTitle">
+    <h2 id="arvoreTitle">🌳 Baixar árvore mercadológica</h2>
+    <p>Selecione o departamento para baixar o CSV com a árvore atualizada (departamento · seção · grupo · subgrupo · key).</p>
+    <div>
+      <label for="arvoreDepto">Departamento</label>
+      <select id="arvoreDepto"></select>
+    </div>
+    <div id="arvoreStatus" aria-live="polite"></div>
+    <div class="arvore-actions">
+      <button class="btn btn-ghost" data-action="fecharModalArvore">Cancelar</button>
+      <button class="btn btn-primary" id="arvoreCta" data-action="baixarArvore">↓ Baixar CSV</button>
+    </div>
+  </div>
+</div>
+
+<div id="restartOverlay" class="hidden">
+  <div class="restart-card" role="alertdialog" aria-modal="true" aria-labelledby="restartTitle">
+    <div class="restart-icon">↑</div>
+    <h2 id="restartTitle">Atualização instalada</h2>
+    <p>Uma nova versão foi instalada com sucesso. Feche e reabra o programa para aplicar a atualização.</p>
+    <span class="restart-badge">reinício necessário</span>
+    <p class="restart-note">Esta janela permanecerá bloqueada até o programa ser reiniciado.</p>
+  </div>
+</div>
+
+<div id="toasts" role="region" aria-live="polite" aria-label="Notificações"></div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
