@@ -31,7 +31,7 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
-const version = "1.4.0"
+const version = "1.4.1"
 
 const fotosVMURL = "http://192.168.0.25:8000/processar-fotos"
 const arvoreVMURL = "http://192.168.0.25:8000/arvore"
@@ -414,9 +414,9 @@ type MargemSubgrupo struct {
 }
 
 type arvoreItem struct {
-	SubGrupoProdutoKey int    `json:"subGrupoProdutoKey"`
-	Tipo               string `json:"tipo"`
-	MargensPossiveis   []struct {
+	CategoriaKey     int    `json:"categoriaKey"`
+	Tipo             string `json:"tipo"`
+	MargensPossiveis []struct {
 		ValorMargem  float64 `json:"valorMargem"`
 		QuebraMargem float64 `json:"quebraMargem"`
 	} `json:"margensPossiveis"`
@@ -440,7 +440,7 @@ func consultarMargemSubgrupo(tenant, token string, key int, rl *runLog) (MargemS
 		return MargemSubgrupo{}, fmt.Errorf("resposta inválida da árvore mercadológica")
 	}
 	for _, it := range itens {
-		if it.Tipo != "SUBGRUPO" || it.SubGrupoProdutoKey != key {
+		if it.Tipo != "SUBGRUPO" || it.CategoriaKey != key {
 			continue
 		}
 		m := MargemSubgrupo{Existe: true}
